@@ -24,7 +24,6 @@ fn displays_descriptive_flags_in_help() {
         "--retention-baseline-duration-hours",
         "--retention-test-temperature-c",
         "--temperature-sample-interval-seconds",
-        "--coordinator-task-timeout-ms",
     ];
     let retention_flags = [
         "--log-dir",
@@ -51,6 +50,7 @@ fn displays_descriptive_flags_in_help() {
         }
         assert!(!help.contains("P_ref"));
         assert!(!help.contains("--program-erase-cycles-k"));
+        assert!(!help.contains("--coordinator-task-timeout-ms"));
     }
 }
 
@@ -78,8 +78,6 @@ fn accepts_descriptive_flags_before_device_discovery() {
         "2160",
         "--retention-test-temperature-c",
         "80",
-        "--coordinator-task-timeout-ms",
-        "3600000",
     ];
     for (subcommand, options) in [
         ("pretest", pretest_options.as_slice()),

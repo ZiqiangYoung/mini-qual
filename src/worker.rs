@@ -53,7 +53,6 @@ enum WorkerState {
 pub struct Timing {
     pub heartbeat_interval_ms: u64,
     pub heartbeat_timeout_ms: u64,
-    pub task_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -61,6 +60,7 @@ struct Registration {
     run_id: Uuid,
     instance_id: Uuid,
     state: WorkerState,
+    task_timeout_ms: Option<u64>,
     #[serde(flatten)]
     timing: Timing,
 }
@@ -230,26 +230,15 @@ impl Session {
 
 struct Health {
     lease_expires_at: Instant,
-    task_expires_at: Option<Instant>,
     terminal: Option<WorkerState>,
     failure: Option<String>,
 }
 
 impl Health {
-    fn deadline(&self) -> Instant {
-        self.task_expires_at.map_or(self.lease_expires_at, |task| {
-            cmp::min(self.lease_expires_at, task)
-        })
-    }
-
     fn expiry(&self, now: Instant) -> Option<&'static str> {
-        if self.task_expires_at.is_some_and(|task| now >= task) {
-            Some("coordinator worker task deadline reached")
-        } else if now >= self.lease_expires_at {
-            Some("coordinator worker heartbeat lease could not be renewed before its deadline")
-        } else {
-            None
-        }
+        (now >= self.lease_expires_at).then_some(
+            "coordinator worker heartbeat lease could not be renewed before its deadline",
+        )
     }
 }
 
@@ -325,7 +314,10 @@ fn heartbeat(
                 stop.store(true, Ordering::Release);
                 return;
             }
-            cmp::min(REQUEST_TIMEOUT, health.deadline().duration_since(sent_at))
+            cmp::min(
+                REQUEST_TIMEOUT,
+                health.lease_expires_at.duration_since(sent_at),
+            )
         };
         let reply = session.post("heartbeat", &payload, timeout);
         let mut health = lock_health(health);
@@ -351,8 +343,11 @@ fn heartbeat(
             stop.store(true, Ordering::Release);
             return;
         }
-        let next = sent_at.checked_add(interval).unwrap_or(health.deadline());
-        let wait = cmp::min(next, health.deadline()).saturating_duration_since(Instant::now());
+        let next = sent_at
+            .checked_add(interval)
+            .unwrap_or(health.lease_expires_at);
+        let wait =
+            cmp::min(next, health.lease_expires_at).saturating_duration_since(Instant::now());
         drop(health);
         if !matches!(
             shutdown.recv_timeout(wait),
@@ -376,32 +371,20 @@ impl Worker {
         endpoint: &str,
         run_id: Uuid,
         name: &str,
-        task_timeout_ms: Option<u64>,
         stop: Arc<AtomicBool>,
     ) -> Result<Self> {
         ensure!(
             !name.is_empty() && name.len() <= 128,
             "worker name must be 1–128 UTF-8 bytes"
         );
-        ensure!(
-            task_timeout_ms != Some(0),
-            "worker task timeout must be positive when supplied"
-        );
         let endpoint = validate_endpoint(endpoint)?;
         let instance_id = Uuid::new_v4();
         let run_url = format!("{endpoint}/v1/runs/{run_id}");
         let session = Session::new(run_url.clone(), run_id, instance_id)?;
         let heartbeat_session = Session::new(run_url, run_id, instance_id)?;
-        let mut payload = json!({ "name": name });
-        if let Some(timeout) = task_timeout_ms {
-            payload["task_timeout_ms"] = json!(timeout);
-        }
+        let payload = json!({ "name": name });
 
-        let started_at = Instant::now();
-        let registration_budget = task_timeout_ms
-            .map(Duration::from_millis)
-            .map_or(RETRY_BUDGET, |timeout| cmp::min(RETRY_BUDGET, timeout));
-        let registration_deadline = started_at + registration_budget;
+        let registration_deadline = Instant::now() + RETRY_BUDGET;
         let mut backoff = INITIAL_BACKOFF;
         let mut first_delivered_request_at = None;
         let (registration, registered_at): (Registration, Instant) = loop {
@@ -425,7 +408,7 @@ impl Worker {
                     break (registration, first_delivered_request_at.unwrap_or(sent_at));
                 }
                 Err(error) if error.retryable() => {
-                    // A request with a lost response may have already started the server timers.
+                    // A request with a lost response may have already started the heartbeat lease.
                     if error.could_have_reached_server() {
                         first_delivered_request_at.get_or_insert(sent_at);
                     }
@@ -452,6 +435,10 @@ impl Worker {
             "coordinator worker {instance_id} registered in a non-active state: {:?}",
             registration.state
         );
+        ensure!(
+            registration.task_timeout_ms.unwrap_or(0) == 0,
+            "coordinator reports a finite worker task timeout; disable it before starting endurance"
+        );
         let timing = registration.timing;
         ensure!(
             timing.heartbeat_interval_ms > 0 && timing.heartbeat_timeout_ms > 0,
@@ -460,17 +447,8 @@ impl Worker {
         let lease_expires_at = registered_at
             .checked_add(Duration::from_millis(timing.heartbeat_timeout_ms))
             .context("coordinator heartbeat lease is outside the timer range")?;
-        let task_expires_at = match timing.task_timeout_ms {
-            Some(timeout) if timeout > 0 => Some(
-                registered_at
-                    .checked_add(Duration::from_millis(timeout))
-                    .context("coordinator task timeout is outside the timer range")?,
-            ),
-            _ => None,
-        };
         let health = Arc::new(Mutex::new(Health {
             lease_expires_at,
-            task_expires_at,
             terminal: None,
             failure: None,
         }));
@@ -545,7 +523,7 @@ impl Worker {
                 return confirm_state(outcome, state);
             }
             let failure = health.failure.clone();
-            let send_deadline = cmp::min(deadline, health.deadline());
+            let send_deadline = cmp::min(deadline, health.lease_expires_at);
             drop(health);
             if let Some(failure) = failure {
                 break failure;

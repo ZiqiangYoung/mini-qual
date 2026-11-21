@@ -2,29 +2,35 @@ use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use mini_qual::worker::{Outcome, Worker};
+use reqwest::Client;
 use serde_json::Value;
+use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 #[test]
 fn worker_rejects_invalid_registration_inputs() {
     let run_id = Uuid::new_v4();
     let stop = Arc::new(AtomicBool::new(false));
-    for (endpoint, name, timeout) in [
-        ("https://127.0.0.1:17653", "test", None),
-        ("http://127.0.0.1:17653", "", None),
-        ("http://127.0.0.1:17653", "test", Some(0)),
+    for (endpoint, name) in [
+        ("https://127.0.0.1:17653", "test"),
+        ("http://127.0.0.1:17653", ""),
     ] {
-        assert!(Worker::register(endpoint, run_id, name, timeout, Arc::clone(&stop)).is_err());
+        assert!(Worker::register(endpoint, run_id, name, Arc::clone(&stop)).is_err());
     }
 }
 
-#[test]
-#[ignore = "requires a running local coordinator in dry-run mode"]
-fn coordinator_dry_run() -> Result<()> {
+struct DryRunCoordinator {
+    endpoint: String,
+    run_id: Uuid,
+    runtime: Runtime,
+    client: Client,
+}
+
+fn connect_dry_run_coordinator() -> Result<DryRunCoordinator> {
     let endpoint = env::var("MINI_QUAL_DRY_RUN_ENDPOINT")?;
     let run_id: Uuid = env::var("MINI_QUAL_DRY_RUN_ID")?.parse()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -47,26 +53,36 @@ fn coordinator_dry_run() -> Result<()> {
         "expected a dry-run coordinator"
     );
     ensure!(health["run_id"] == run_id.to_string(), "run ID mismatch");
+    Ok(DryRunCoordinator {
+        endpoint,
+        run_id,
+        runtime,
+        client,
+    })
+}
+
+#[test]
+#[ignore = "requires a running local coordinator in dry-run mode with no task deadline"]
+fn coordinator_dry_run() -> Result<()> {
+    let DryRunCoordinator {
+        endpoint,
+        run_id,
+        runtime,
+        client,
+    } = connect_dry_run_coordinator()?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let mismatched = Worker::register(
         &endpoint,
         Uuid::new_v4(),
         "dry-run-wrong-id",
-        None,
         Arc::clone(&stop),
     );
     ensure!(
         matches!(mismatched, Err(error) if format!("{error:#}").contains("run_mismatch")),
         "a registration with the wrong run ID must fail"
     );
-    let worker = Worker::register(
-        &endpoint,
-        run_id,
-        "dry-run-success",
-        None,
-        Arc::clone(&stop),
-    )?;
+    let worker = Worker::register(&endpoint, run_id, "dry-run-success", Arc::clone(&stop))?;
     let timing = worker.timing();
     ensure!(
         timing.heartbeat_timeout_ms <= 5000,
@@ -82,39 +98,11 @@ fn coordinator_dry_run() -> Result<()> {
     worker.complete(Outcome::Succeeded, "simulated data flushed")?;
 
     let stop = Arc::new(AtomicBool::new(false));
-    let worker = Worker::register(
-        &endpoint,
-        run_id,
-        "dry-run-failure",
-        None,
-        Arc::clone(&stop),
-    )?;
+    let worker = Worker::register(&endpoint, run_id, "dry-run-failure", Arc::clone(&stop))?;
     let failed_id = worker.instance_id();
     stop.store(true, Ordering::Release);
     worker.check_active()?;
     worker.complete(Outcome::Failed, "simulated interruption")?;
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker = Worker::register(
-        &endpoint,
-        run_id,
-        "dry-run-expiry",
-        Some(750),
-        Arc::clone(&stop),
-    )?;
-    let expiration_limit = Instant::now() + Duration::from_secs(3);
-    while !stop.load(Ordering::Acquire) && Instant::now() < expiration_limit {
-        thread::sleep(Duration::from_millis(20));
-    }
-    ensure!(
-        stop.load(Ordering::Acquire),
-        "task expiry did not cancel business work"
-    );
-    ensure!(worker.check_active().is_err(), "expired task still active");
-    ensure!(
-        worker.complete(Outcome::Succeeded, "too late").is_err(),
-        "expired task accepted completion"
-    );
 
     let status: Value = runtime.block_on(async {
         client
@@ -136,5 +124,26 @@ fn coordinator_dry_run() -> Result<()> {
             "worker {instance_id} missing expected outcome {outcome}"
         );
     }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a running local coordinator in dry-run mode with a finite task deadline"]
+fn coordinator_rejects_finite_task_deadline() -> Result<()> {
+    let coordinator = connect_dry_run_coordinator()?;
+    let error = Worker::register(
+        &coordinator.endpoint,
+        coordinator.run_id,
+        "dry-run-finite-deadline",
+        Arc::new(AtomicBool::new(false)),
+    )
+    .err()
+    .context("worker accepted a finite coordinator task deadline")?;
+    ensure!(
+        error
+            .to_string()
+            .contains("coordinator reports a finite worker task timeout"),
+        "unexpected registration error: {error:#}"
+    );
     Ok(())
 }

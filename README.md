@@ -57,7 +57,9 @@ mini-qual run --sn FORMAL_SSD_SN --pe 3.25 --nand-capacity 4TiB \
   --retention-test-temperature-c 80
 ```
 
-`RUN_ID` 为部署者从 health 输出取得的 UUID。先让本批次的所有 CLI 实例注册，然后由部署者执行 `./barrierctl close --run-id "$RUN_ID"`。使用 `./barrierctl status --run-id "$RUN_ID"` 查看进度。每个进程只操作一张盘，可对不同 SN 手动启动多个进程。长时间试验可通过 `--coordinator-task-timeout-ms` 指定可覆盖整场运行的任务时限，也可使用随附协调器支持的 `--task-timeout 0`。心跳只续租，任务总时限从注册起计。
+`RUN_ID` 为部署者从 health 输出取得的 UUID。先让本批次的所有 CLI 实例注册，然后由部署者执行 `./barrierctl close --run-id "$RUN_ID"`。使用 `./barrierctl status --run-id "$RUN_ID"` 查看进度。每个进程只操作一张盘，可对不同 SN 手动启动多个进程。
+
+磨损要求协调器关闭任务总时限。随附协调器默认采用此配置。如果协调器报告有限的任务总时限，CLI 会在写盘前退出。磨损卡住但心跳仍正常时，协调器会继续等待，由操作人员排查进程。
 
 PE 以 K 为单位，`3.25` 与 `3.25K` 均展开为 3250。容量可用字节、二进制单位（如 KiB、GiB、PiB）或十进制单位（如 GB、TB），上限 2 PiB。PE 必须展开为整数，已烧录的实际 NAND 容量必须按逻辑块对齐。主机可见容量以当前设备为准。
 

@@ -106,9 +106,6 @@ struct RunArgs {
     /// 断电协调服务 HTTP 地址
     #[arg(long, default_value = "http://127.0.0.1:17653")]
     coordinator: String,
-    /// 断电协调任务总超时，单位毫秒。省略时使用服务端设置
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-    coordinator_task_timeout_ms: Option<u64>,
 }
 
 #[derive(Args)]
@@ -250,7 +247,6 @@ fn run(args: RunArgs) -> Result<()> {
                 "retention": parameters,
                 "coordinator": args.coordinator,
                 "run_id": args.run_id,
-                "requested_coordinator_task_timeout_ms": args.coordinator_task_timeout_ms,
             }),
         )?;
         let fio = Fio::new(args.device.fio.clone(), log.dir.clone(), &device, &stop)?;
@@ -259,7 +255,6 @@ fn run(args: RunArgs) -> Result<()> {
             &args.coordinator,
             args.run_id,
             &format!("mini-qual/{}", device.serial),
-            args.coordinator_task_timeout_ms,
             Arc::clone(&stop),
         )
         .context("registering the poweroff worker")?;
