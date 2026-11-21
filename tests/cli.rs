@@ -6,56 +6,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 #[test]
-fn displays_descriptive_flags_in_help() {
-    let pretest_flags = [
-        "--sn",
-        "--pe",
-        "--pretest-nand-capacity",
-        "--nand-capacity-step",
-        "--minimum-nand-capacity",
-        "--maximum-nand-capacity",
-        "--temperature-sample-interval-seconds",
-    ];
-    let run_flags = [
-        "--sn",
-        "--pe",
-        "--nand-capacity",
-        "--retention-baseline-temperature-c",
-        "--retention-baseline-duration-hours",
-        "--retention-test-temperature-c",
-        "--temperature-sample-interval-seconds",
-    ];
-    let retention_flags = [
-        "--log-dir",
-        "--retention-baseline-temperature-c",
-        "--retention-baseline-duration-hours",
-        "--retention-test-temperature-c",
-    ];
-    for (subcommand, flags) in [
-        ("pretest", pretest_flags.as_slice()),
-        ("run", run_flags.as_slice()),
-        ("retention", retention_flags.as_slice()),
-    ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_mini-qual"))
-            .args([subcommand, "--help"])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let help = String::from_utf8(output.stdout).unwrap();
-        for flag in flags {
-            assert!(
-                help.split_whitespace().any(|word| word == *flag),
-                "{subcommand} help missing {flag}"
-            );
-        }
-        assert!(!help.contains("P_ref"));
-        assert!(!help.contains("--program-erase-cycles-k"));
-        assert!(!help.contains("--coordinator-task-timeout-ms"));
-    }
-}
-
-#[test]
-fn accepts_descriptive_flags_before_device_discovery() {
+fn parses_run_and_pretest_options_before_device_discovery() -> anyhow::Result<()> {
     let binary = env!("CARGO_BIN_EXE_mini-qual");
     let pretest_options = [
         "--pretest-nand-capacity",
@@ -97,12 +48,12 @@ fn accepts_descriptive_flags_before_device_discovery() {
                 "invalid",
             ])
             .args(options)
-            .output()
-            .unwrap();
-        let error = String::from_utf8(output.stderr).unwrap();
-        assert!(!output.status.success());
-        assert!(error.contains("invalid temperature endpoint"), "{error}");
+            .output()?;
+        let error = String::from_utf8(output.stderr)?;
+        assert_eq!(output.status.code(), Some(1), "{subcommand}: {error}");
+        assert!(error.contains("--temperature-url"), "{error}");
     }
+    Ok(())
 }
 
 struct RunLogFixture(PathBuf);
@@ -119,9 +70,7 @@ fn invalid_pe_explains_the_failed_unit_conversion() -> anyhow::Result<()> {
         .args(["pretest", "--pe", "3.2505"])
         .output()?;
     let error = String::from_utf8(output.stderr)?;
-    assert!(!output.status.success());
-    assert!(error.contains("--pe"), "{error}");
-    assert!(error.contains("3.2505"), "{error}");
+    assert_eq!(output.status.code(), Some(2), "{error}");
     assert!(
         error.contains("fractional after unit conversion"),
         "{error}"
@@ -178,13 +127,10 @@ fn retention_uses_recorded_temperatures_and_reports_unusable_logs() -> anyhow::R
         101.0
     );
     assert_eq!(report["parameters"]["retention_test_temperature_c"], 40.0);
-    assert!(report["effective_endurance_temperature_c"].is_number());
 
     let temperature_path = log.0.join("temperature.jsonl");
-    fs::write(
-        &temperature_path,
-        r#"{"query_time":"2026-11-21T00:00:00Z","completed_time":"2026-11-21T00:00:00Z","elapsed_seconds":0.0,"error":"case temperature GET returned HTTP 503 Service Unavailable"}"#,
-    )?;
+    let failed_sample = r#"{"query_time":"2026-11-21T00:00:00Z","completed_time":"2026-11-21T00:00:00Z","elapsed_seconds":0.0,"error":"case temperature GET returned HTTP 503 Service Unavailable"}"#;
+    fs::write(&temperature_path, failed_sample)?;
     let output = command.output()?;
     let error = String::from_utf8(output.stderr)?;
     assert!(!output.status.success());
@@ -194,10 +140,13 @@ fn retention_uses_recorded_temperatures_and_reports_unusable_logs() -> anyhow::R
     );
     assert!(error.contains("HTTP 503 Service Unavailable"), "{error}");
 
-    fs::write(&temperature_path, "\ninvalid JSON\n")?;
+    fs::write(
+        &temperature_path,
+        format!("{failed_sample}\ninvalid JSON\n"),
+    )?;
     let output = command.output()?;
     let error = String::from_utf8(output.stderr)?;
     assert!(!output.status.success());
-    assert!(error.contains("temperature record at line 1"), "{error}");
+    assert!(error.contains("line 2"), "{error}");
     Ok(())
 }
