@@ -63,13 +63,21 @@ fn requires_one_namespace_with_id_one_and_aligned_visible_capacity() -> Result<(
     assert_eq!(super::volume_bytes(&namespace, 4096)?, 16_384);
 
     fixture.write("nvme5/nvme5n1/size", "31")?;
-    assert!(super::volume_bytes(&namespace, 4096).is_err());
+    let error = super::volume_bytes(&namespace, 4096).expect_err("misaligned capacity");
+    assert!(error.to_string().contains("15872 bytes of capacity"));
+    assert!(error.to_string().contains("4096-byte logical block"));
     fixture.write("nvme5/nvme5n1/nsid", "2")?;
-    assert!(super::find_namespace(&controller, &fixture.0).is_err());
+    let error = super::find_namespace(&controller, &fixture.0).expect_err("incorrect NSID");
+    assert!(
+        error
+            .to_string()
+            .contains("exposes NSID 2, expected NSID 1")
+    );
     fixture.write("nvme5/nvme5n1/nsid", "1")?;
     fixture.write("nvme5/nvme5n2/nsid", "2")?;
     fixture.write("nvme5/nvme5n2/dev", "259:2")?;
-    assert!(super::find_namespace(&controller, &fixture.0).is_err());
+    let error = super::find_namespace(&controller, &fixture.0).expect_err("multiple namespaces");
+    assert!(error.to_string().contains("exposes 2 block namespaces"));
     Ok(())
 }
 

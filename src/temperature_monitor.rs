@@ -45,19 +45,19 @@ pub struct TemperatureSource {
 
 impl TemperatureSource {
     pub fn new(url: &str, pointer: Option<String>, interval: Duration) -> Result<Self> {
-        let url = Url::parse(url).context("invalid temperature endpoint")?;
+        let url = Url::parse(url).context("invalid temperature endpoint in --temperature-url")?;
         ensure!(
             url.scheme() == "http" && url.has_host(),
-            "temperature endpoint must be an HTTP URL"
+            "--temperature-url requires an HTTP URL with a host (e.g. http://127.0.0.1:30030/devices/SN/temperature)"
         );
         ensure!(
             !interval.is_zero(),
-            "temperature sample interval must be positive"
+            "--temperature-sample-interval-seconds must be greater than zero"
         );
         if let Some(pointer) = &pointer {
             ensure!(
                 pointer.is_empty() || pointer.starts_with('/'),
-                "temperature JSON pointer must be empty or begin with '/'"
+                "--temperature-pointer {pointer:?} must be empty or begin with '/' (e.g. /data/temperature)"
             );
         }
         Ok(Self {
@@ -73,15 +73,19 @@ impl TemperatureSource {
         started: Instant,
         print_each: bool,
     ) -> Result<TemperatureMonitor> {
-        let file = File::create_new(log_dir.join("temperature.jsonl"))?;
+        let path = log_dir.join("temperature.jsonl");
+        let file = File::create_new(&path)
+            .with_context(|| format!("creating case temperature log {}", path.display()))?;
         let client = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(2))
-            .build()?;
+            .build()
+            .context("initializing the case temperature HTTP client")?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()?;
+            .build()
+            .context("initializing the case temperature HTTP runtime")?;
         let (stop, receiver) = mpsc::channel();
         let (first_attempt, first_attempt_ready) = mpsc::channel();
         let thread = thread::Builder::new()
@@ -117,17 +121,24 @@ impl TemperatureSource {
                         measured_case_temperature_c: parsed.as_ref().ok().copied(),
                         error: parsed.err(),
                     };
-                    run_log::write_json_line(&mut file, &measurement)?;
+                    run_log::write_json_line(&mut file, &measurement).with_context(|| {
+                        format!("writing case temperature sample to {}", path.display())
+                    })?;
                     if let Some(first_attempt) = first_attempt.take() {
                         let _ = first_attempt.send(());
                     }
                     let remaining = self.interval.saturating_sub(query_started.elapsed());
                     match receiver.recv_timeout(remaining) {
                         Err(RecvTimeoutError::Timeout) => (),
-                        _ => return file.sync_all().context("syncing the temperature timeline"),
+                        _ => {
+                            return file.sync_all().with_context(|| {
+                                format!("syncing case temperature log {}", path.display())
+                            });
+                        }
                     }
                 }
-            })?;
+            })
+            .context("starting the case temperature sampler thread")?;
         let monitor = TemperatureMonitor {
             stop,
             thread: Some(thread),
@@ -142,7 +153,16 @@ impl TemperatureSource {
     async fn query(&self, client: &Client) -> (Option<u16>, Option<String>, Option<String>) {
         let mut response = match client.get(self.url.clone()).send().await {
             Ok(response) => response,
-            Err(error) => return (None, None, Some(error.to_string())),
+            Err(error) => {
+                return (
+                    None,
+                    None,
+                    Some(format!(
+                        "case temperature GET failed: {:#}",
+                        anyhow::Error::new(error)
+                    )),
+                );
+            }
         };
         let status = response.status();
         let mut body = Vec::new();
@@ -159,28 +179,41 @@ impl TemperatureSource {
                     );
                 }
                 Ok(None) => break,
-                Err(error) => return (Some(status.as_u16()), None, Some(error.to_string())),
+                Err(error) => {
+                    return (
+                        Some(status.as_u16()),
+                        None,
+                        Some(format!(
+                            "reading case temperature response body (HTTP {status}): {:#}",
+                            anyhow::Error::new(error)
+                        )),
+                    );
+                }
             }
         }
         match String::from_utf8(body) {
             Ok(body) => (
                 Some(status.as_u16()),
                 Some(body),
-                (!status.is_success()).then(|| format!("HTTP {}", status.as_u16())),
+                (!status.is_success())
+                    .then(|| format!("case temperature GET {} returned HTTP {status}", self.url)),
             ),
             Err(error) => (Some(status.as_u16()), None, Some(error.to_string())),
         }
     }
 
     fn parse_temperature(&self, body: &str) -> Result<f64> {
-        let value: Value = serde_json::from_str(body).context("invalid temperature JSON")?;
+        let value: Value =
+            serde_json::from_str(body).context("case temperature response is not valid JSON")?;
         if let Some(pointer) = &self.pointer {
-            let field = value
-                .pointer(pointer)
-                .context("temperature JSON pointer is missing")?;
-            return thermal::temperature(
-                numeric(field).context("temperature field is not numeric")?,
-            );
+            let field = value.pointer(pointer).with_context(|| {
+                format!("--temperature-pointer {pointer:?} did not match a field in the response")
+            })?;
+            return thermal::temperature(numeric(field).with_context(|| {
+                format!(
+                    "the response field at --temperature-pointer {pointer:?} must be a number in °C"
+                )
+            })?);
         }
         if let Some(number) = numeric(&value) {
             return thermal::temperature(number);
@@ -203,7 +236,10 @@ impl TemperatureSource {
             match matches.as_slice() {
                 [number] => return thermal::temperature(*number),
                 [] => (),
-                _ => bail!("ambiguous case temperature JSON; set --temperature-pointer"),
+                _ => bail!(
+                    "response contains {} possible case temperatures. Use --temperature-pointer to select the field",
+                    matches.len()
+                ),
             }
         }
         bail!("no recognizable case temperature field; set --temperature-pointer")
@@ -259,17 +295,41 @@ impl Drop for TemperatureMonitor {
 }
 
 pub fn read_samples(log_dir: &Path) -> Result<Vec<Sample>> {
-    let file = File::open(log_dir.join("temperature.jsonl"))?;
+    let path = log_dir.join("temperature.jsonl");
+    let file = File::open(&path)
+        .with_context(|| format!("opening case temperature log {}", path.display()))?;
     let mut samples = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let entry: Measurement =
-            serde_json::from_str(&line?).context("reading temperature timeline")?;
+    let mut last_query_error = None;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line_number = index + 1;
+        let line =
+            line.with_context(|| format!("reading line {line_number} of {}", path.display()))?;
+        let entry: Measurement = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "invalid case temperature record at line {line_number} of {}",
+                path.display()
+            )
+        })?;
         if let Some(measured_case_temperature_c) = entry.measured_case_temperature_c {
             samples.push(Sample {
                 elapsed_seconds: entry.elapsed_seconds,
                 measured_case_temperature_c,
             });
+        } else if let Some(error) = entry.error {
+            last_query_error = Some(error);
         }
+    }
+    if samples.is_empty() {
+        if let Some(error) = last_query_error {
+            bail!(
+                "no usable case temperatures in {}. Last query failure: {error}",
+                path.display()
+            );
+        }
+        bail!(
+            "no valid case temperature samples were recorded in {}",
+            path.display()
+        );
     }
     Ok(samples)
 }

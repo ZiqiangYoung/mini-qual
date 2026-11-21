@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Args, Parser, Subcommand};
 use mini_qual::plan;
 use mini_qual::plan::{Budget, CapacityRange, RoundTiming, TimingModel};
@@ -257,7 +257,12 @@ fn run(args: RunArgs) -> Result<()> {
             &format!("mini-qual/{}", device.serial),
             Arc::clone(&stop),
         )
-        .context("registering the poweroff worker")?;
+        .with_context(|| {
+            format!(
+                "registering SN {} with poweroff coordinator run {}",
+                device.serial, args.run_id
+            )
+        })?;
         Ok((fio, worker))
     })();
     let (fio, worker) = match setup {
@@ -285,7 +290,9 @@ fn run(args: RunArgs) -> Result<()> {
         let window = result?;
         sampler_result?;
         let samples = temperature_monitor::read_samples(&log.dir)?;
-        let estimate = parameters.estimate(window, &samples)?;
+        let estimate = parameters
+            .estimate(window, &samples)
+            .context("calculating retention duration from the recorded case temperatures")?;
         log.report("retention.json", &estimate)?;
         log.event("retention_estimate", serde_json::to_value(&estimate)?)?;
         println!(
@@ -301,7 +308,9 @@ fn run(args: RunArgs) -> Result<()> {
     })();
     drop(ownership);
     let operation = match (operation, worker.check_active()) {
-        (Err(error), Err(coordinator)) => Err(error.context(format!("{coordinator:#}"))),
+        (Err(error), Err(coordinator)) => Err(anyhow!(
+            "{error:#}. Poweroff coordinator also reported: {coordinator:#}"
+        )),
         (operation, _) => operation,
     };
     let operation = seal_trial(&mut log, operation);
@@ -329,7 +338,9 @@ fn run(args: RunArgs) -> Result<()> {
     match (operation, handoff) {
         (Ok(()), result) => result,
         (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(handoff)) => Err(error.context(format!("{handoff:#}"))),
+        (Err(error), Err(handoff)) => Err(anyhow!(
+            "{error:#}. Could not report the trial outcome: {handoff:#}"
+        )),
     }
 }
 
@@ -380,7 +391,9 @@ fn formal_io(
         trial.flush("retention", rounds + 1)?;
         ensure!(
             trial.written_blocks == budget.total_host_write_budget_blocks,
-            "host write budget mismatch"
+            "trial wrote {} logical blocks, expected {} in the total host write budget",
+            trial.written_blocks,
+            budget.total_host_write_budget_blocks
         );
         Ok::<_, anyhow::Error>(())
     })();
@@ -409,7 +422,10 @@ fn pretest(args: PretestArgs) -> Result<()> {
     };
     ensure!(
         args.pretest_nand_capacity > device.host_visible_capacity_bytes,
-        "pretest NAND capacity must be larger than the host-visible capacity"
+        "--pretest-nand-capacity is {} bytes but must exceed the host-visible capacity of {} bytes on {}",
+        args.pretest_nand_capacity,
+        device.host_visible_capacity_bytes,
+        device.path.display()
     );
     range.validate(
         device.host_visible_capacity_bytes,
@@ -537,21 +553,31 @@ fn seal_trial(log: &mut RunLog, result: Result<()>) -> Result<()> {
     match (result, record.and(sync)) {
         (result, Ok(())) => result,
         (Ok(()), Err(error)) => Err(error.context("sealing trial logs")),
-        (Err(error), Err(logging)) => {
-            Err(error.context(format!("sealing trial logs: {logging:#}")))
-        }
+        (Err(error), Err(logging)) => Err(anyhow!(
+            "{error:#}. Could not also finalize the trial logs: {logging:#}"
+        )),
     }
 }
 
 fn retention(args: RetentionArgs) -> Result<()> {
     let parameters = RetentionParameters::from(&args.conditions);
     parameters.validate()?;
-    let window_file =
-        File::open(args.log_dir.join("wear-window.json")).context("opening wear window")?;
-    let window =
-        serde_json::from_reader(BufReader::new(window_file)).context("reading wear window")?;
+    let window_path = args.log_dir.join("wear-window.json");
+    let window_file = File::open(&window_path).with_context(|| {
+        format!(
+            "opening wear window {} from --log-dir",
+            window_path.display()
+        )
+    })?;
+    let window = serde_json::from_reader(BufReader::new(window_file))
+        .with_context(|| format!("reading wear window JSON {}", window_path.display()))?;
     let samples = temperature_monitor::read_samples(&args.log_dir)?;
-    let estimate = parameters.estimate(window, &samples)?;
+    let estimate = parameters.estimate(window, &samples).with_context(|| {
+        format!(
+            "calculating retention duration from {}",
+            args.log_dir.display()
+        )
+    })?;
     println!("{}", serde_json::to_string_pretty(&estimate)?);
     Ok(())
 }
@@ -623,7 +649,8 @@ impl Trial<'_> {
         let stage = self.fio_stage(phase, round, "write", |fio| fio.write(phase, round, bytes))?;
         ensure!(
             stage.successful_bytes == bytes,
-            "incomplete sequential write"
+            "fio wrote {} bytes during {phase} round {round}, expected {bytes} bytes",
+            stage.successful_bytes
         );
         self.written_blocks += u128::from(bytes / self.device.logical_block_bytes);
         self.log.event(
@@ -695,9 +722,15 @@ impl Trial<'_> {
         operation: &str,
         error: anyhow::Error,
     ) -> Result<T> {
-        self.log.event("stage_error", json!({
+        let result = self.log.event("stage_error", json!({
             "phase": phase, "round": round, "operation": operation, "reason": format!("{error:#}"),
-        }))?;
-        Err(error).with_context(|| format!("{phase} round {round} {operation}"))
+        }));
+        let error = error.context(format!("{phase} round {round} {operation}"));
+        match result {
+            Ok(()) => Err(error),
+            Err(log_error) => Err(anyhow!(
+                "{error:#}. Could not also record the stage error: {log_error:#}"
+            )),
+        }
     }
 }

@@ -49,7 +49,7 @@ pub struct RetentionEstimate {
 pub fn temperature(value: f64) -> Result<f64> {
     ensure!(
         value.is_finite() && value > -CELSIUS_TO_KELVIN_OFFSET,
-        "temperature in °C must be finite and above absolute zero"
+        "temperature must be finite and above -273.15 °C, got {value} °C"
     );
     Ok(value)
 }
@@ -71,12 +71,13 @@ pub fn equivalent_wear_seconds(window: WearWindow, samples: &[Sample]) -> Result
     let end = window.end_seconds;
     let maximum_gap = 3.0 * window.temperature_sample_interval_seconds;
     ensure!(
-        start.is_finite()
-            && end.is_finite()
-            && end > start
-            && maximum_gap.is_finite()
-            && maximum_gap > 0.0,
-        "invalid wear window"
+        start.is_finite() && end.is_finite() && end > start,
+        "wear window must end after it starts, with finite timestamps (start {start} s, end {end} s)"
+    );
+    ensure!(
+        maximum_gap.is_finite() && maximum_gap > 0.0,
+        "temperature sampling interval {} s does not yield a finite positive coverage limit",
+        window.temperature_sample_interval_seconds
     );
     let first = samples
         .first()
@@ -84,16 +85,31 @@ pub fn equivalent_wear_seconds(window: WearWindow, samples: &[Sample]) -> Result
     let last = samples
         .last()
         .context("no successful case temperature measurements")?;
-    ensure!(
-        samples
-            .iter()
-            .all(|sample| sample.elapsed_seconds.is_finite()
-                && temperature(sample.measured_case_temperature_c).is_ok())
-            && samples
-                .windows(2)
-                .all(|pair| pair[0].elapsed_seconds < pair[1].elapsed_seconds),
-        "invalid case temperature timeline"
-    );
+    for (index, sample) in samples.iter().enumerate() {
+        ensure!(
+            sample.elapsed_seconds.is_finite(),
+            "case temperature sample {} has an invalid elapsed time of {} s",
+            index + 1,
+            sample.elapsed_seconds
+        );
+        temperature(sample.measured_case_temperature_c).with_context(|| {
+            format!(
+                "case temperature sample {} at {:.3} s",
+                index + 1,
+                sample.elapsed_seconds
+            )
+        })?;
+    }
+    if let Some(pair) = samples
+        .windows(2)
+        .find(|pair| pair[0].elapsed_seconds >= pair[1].elapsed_seconds)
+    {
+        anyhow::bail!(
+            "case temperature timestamps must increase, but {} s follows {} s",
+            pair[1].elapsed_seconds,
+            pair[0].elapsed_seconds
+        );
+    }
 
     let rate = |sample: &Sample| {
         acceleration(
@@ -104,9 +120,10 @@ pub fn equivalent_wear_seconds(window: WearWindow, samples: &[Sample]) -> Result
     };
     let mut equivalent = 0.0;
     if start < first.elapsed_seconds {
+        let delay = first.elapsed_seconds - start;
         ensure!(
-            first.elapsed_seconds - start <= maximum_gap,
-            "temperature measurements begin too late to cover the wear window"
+            delay <= maximum_gap,
+            "first valid case temperature is {delay:.3} s after wear began (maximum gap {maximum_gap:.3} s)"
         );
         equivalent += (end.min(first.elapsed_seconds) - start) * rate(first);
     }
@@ -121,7 +138,9 @@ pub fn equivalent_wear_seconds(window: WearWindow, samples: &[Sample]) -> Result
         let gap = next.elapsed_seconds - previous.elapsed_seconds;
         ensure!(
             gap <= maximum_gap,
-            "temperature measurement gap of {gap:.3}s in the wear window"
+            "case temperature samples at {:.3} s and {:.3} s are {gap:.3} s apart during wear (maximum gap {maximum_gap:.3} s)",
+            previous.elapsed_seconds,
+            next.elapsed_seconds
         );
         let previous_rate = rate(previous);
         let slope = (rate(next) - previous_rate) / gap;
@@ -130,27 +149,31 @@ pub fn equivalent_wear_seconds(window: WearWindow, samples: &[Sample]) -> Result
         equivalent += (right - left) * (left_rate + right_rate) / 2.0;
     }
     if last.elapsed_seconds < end {
+        let delay = end - last.elapsed_seconds;
         ensure!(
-            end - last.elapsed_seconds <= maximum_gap,
-            "temperature measurements end too early to cover the wear window"
+            delay <= maximum_gap,
+            "last valid case temperature is {delay:.3} s before wear ended (maximum gap {maximum_gap:.3} s)"
         );
         equivalent += (end - start.max(last.elapsed_seconds)) * rate(last);
     }
     ensure!(
         equivalent.is_finite() && equivalent > 0.0,
-        "invalid equivalent wear time"
+        "case temperature conversion yielded {equivalent} s of equivalent wear, expected a finite positive duration"
     );
     Ok(equivalent)
 }
 
 impl RetentionParameters {
     pub fn validate(self) -> Result<()> {
-        temperature(self.retention_baseline_temperature_c)?;
-        temperature(self.retention_test_temperature_c)?;
+        temperature(self.retention_baseline_temperature_c)
+            .context("invalid --retention-baseline-temperature-c")?;
+        temperature(self.retention_test_temperature_c)
+            .context("invalid --retention-test-temperature-c")?;
         ensure!(
             self.retention_baseline_duration_hours.is_finite()
                 && self.retention_baseline_duration_hours > 0.0,
-            "baseline retention hours must be finite and positive"
+            "--retention-baseline-duration-hours must be finite and positive, got {} hours",
+            self.retention_baseline_duration_hours
         );
         Ok(())
     }
@@ -166,13 +189,18 @@ impl RetentionParameters {
             self.retention_baseline_temperature_c,
             RETENTION_ACTIVATION_ENERGY_EV,
         );
+        ensure!(
+            retention_temperature_factor.is_finite() && retention_temperature_factor > 0.0,
+            "retention temperature conversion from {} °C to {} °C yielded an unusable acceleration factor of {retention_temperature_factor}",
+            self.retention_baseline_temperature_c,
+            self.retention_test_temperature_c,
+        );
         let recommended_hours =
             self.retention_baseline_duration_hours * wear_adjustment / retention_temperature_factor;
         ensure!(
-            retention_temperature_factor.is_finite()
-                && recommended_hours.is_finite()
-                && recommended_hours > 0.0,
-            "retention temperatures or duration are outside the calculation range"
+            recommended_hours.is_finite() && recommended_hours > 0.0,
+            "converting {} baseline hours with temperature factor {retention_temperature_factor} and wear factor {wear_adjustment} yielded {recommended_hours} hours",
+            self.retention_baseline_duration_hours
         );
         let reciprocal_effective_kelvin = 1.0
             / (ENDURANCE_REFERENCE_TEMPERATURE_C + CELSIUS_TO_KELVIN_OFFSET)

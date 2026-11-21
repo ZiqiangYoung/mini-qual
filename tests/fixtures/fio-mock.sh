@@ -31,6 +31,14 @@ completed=$size
 errors=0
 errno=0
 case "$name" in
+    *-round-000002-write)
+        printf '{"jobs":[{"error":28,"write":{"io_bytes":0}}]}\n'
+        exit 1
+        ;;
+    *-round-000003-write)
+        printf 'fio: cannot open namespace for writing: Permission denied\n' >&2
+        exit 1
+        ;;
     *-read)
         printf 'fio: io_u error on file %s: Input/output error: read offset=0, buflen=131072\n' "$file" >&2
         printf 'fio: io_u error on file %s: No data available: read offset=131072, buflen=131072\n' "$file" >&2

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 pub const MAXIMUM_SUPPORTED_CAPACITY_BYTES: u64 = 2 << 50;
@@ -22,16 +22,25 @@ impl Budget {
     ) -> Result<Self> {
         ensure!(pe > 0, "PE must be positive");
         ensure!(
-            nand_capacity_bytes > host_visible_capacity_bytes
-                && nand_capacity_bytes <= MAXIMUM_SUPPORTED_CAPACITY_BYTES,
-            "NAND capacity must be larger than the host-visible capacity and at most 2 PiB"
+            nand_capacity_bytes <= MAXIMUM_SUPPORTED_CAPACITY_BYTES,
+            "--nand-capacity is {nand_capacity_bytes} bytes, above the 2 PiB limit"
         );
         ensure!(
-            logical_block_bytes > 0
-                && host_visible_capacity_bytes > 0
-                && nand_capacity_bytes % logical_block_bytes == 0
+            nand_capacity_bytes > host_visible_capacity_bytes,
+            "--nand-capacity is {nand_capacity_bytes} bytes but must exceed the device's host-visible capacity of {host_visible_capacity_bytes} bytes"
+        );
+        ensure!(
+            logical_block_bytes > 0,
+            "the device reports a logical block size of 0 bytes"
+        );
+        ensure!(
+            host_visible_capacity_bytes > 0
                 && host_visible_capacity_bytes % logical_block_bytes == 0,
-            "NAND and host-visible capacities must be aligned to {logical_block_bytes} bytes"
+            "the device's host-visible capacity of {host_visible_capacity_bytes} bytes must be a positive multiple of its {logical_block_bytes}-byte logical block size"
+        );
+        ensure!(
+            nand_capacity_bytes % logical_block_bytes == 0,
+            "--nand-capacity is {nand_capacity_bytes} bytes but must be a multiple of the device's {logical_block_bytes}-byte logical block size"
         );
         let nand_capacity_blocks = nand_capacity_bytes / logical_block_bytes;
         let host_visible_capacity_blocks = host_visible_capacity_bytes / logical_block_bytes;
@@ -54,7 +63,9 @@ impl Budget {
 pub fn parse_pe(value: &str) -> Result<u64> {
     let value = value.trim();
     let number = value.strip_suffix(['K', 'k']).unwrap_or(value).trim_end();
-    decimal_units(number, 1000).context("PE is expressed in K and must expand to an integer")
+    decimal_units(number, 1000).map_err(|error| {
+        anyhow!("--pe is in thousands of cycles (e.g. 3.25 means 3250 cycles): {error:#}")
+    })
 }
 
 pub fn parse_capacity(value: &str) -> Result<u64> {
@@ -62,6 +73,10 @@ pub fn parse_capacity(value: &str) -> Result<u64> {
     let unit_start = value
         .find(|c: char| !(c.is_ascii_digit() || c == '.'))
         .unwrap_or(value.len());
+    ensure!(
+        unit_start > 0,
+        "capacity must start with a positive decimal number (e.g. 4TiB)"
+    );
     let unit = value[unit_start..].trim().to_ascii_lowercase();
     let multiplier = match unit.as_str() {
         "" | "b" | "byte" | "bytes" => 1,
@@ -75,12 +90,15 @@ pub fn parse_capacity(value: &str) -> Result<u64> {
         "gb" => 1_000_000_000,
         "tb" => 1_000_000_000_000,
         "pb" => 1_000_000_000_000_000,
-        _ => bail!("unsupported capacity unit {unit:?}"),
+        _ => bail!(
+            "unsupported capacity unit {unit:?}. Use B, KiB, MiB, GiB, TiB, PiB or their decimal equivalents"
+        ),
     };
-    let bytes = decimal_units(&value[..unit_start], multiplier)?;
+    let bytes = decimal_units(&value[..unit_start], multiplier)
+        .map_err(|error| anyhow!("capacity must represent a whole number of bytes: {error:#}"))?;
     ensure!(
         bytes <= MAXIMUM_SUPPORTED_CAPACITY_BYTES,
-        "capacity exceeds 2 PiB"
+        "capacity is {bytes} bytes, above the 2 PiB limit"
     );
     Ok(bytes)
 }
@@ -98,7 +116,9 @@ fn decimal_units(number: &str, multiplier: u64) -> Result<u64> {
     let whole = if whole.is_empty() {
         0
     } else {
-        whole.parse::<u64>()?
+        whole
+            .parse::<u64>()
+            .context("integer part exceeds the supported range")?
     };
     let fraction = fraction.trim_end_matches('0');
     let mut expanded = u128::from(whole) * u128::from(multiplier);
@@ -110,7 +130,10 @@ fn decimal_units(number: &str, multiplier: u64) -> Result<u64> {
             .parse::<u128>()?
             .checked_mul(u128::from(multiplier))
             .context("decimal precision is too large")?;
-        ensure!(numerator % divisor == 0, "value has a fractional base unit");
+        ensure!(
+            numerator % divisor == 0,
+            "the value is fractional after unit conversion"
+        );
         expanded += numerator / divisor;
     }
     ensure!(expanded > 0, "value must be positive");
@@ -217,18 +240,35 @@ impl CapacityRange {
             "logical block size must be positive"
         );
         ensure!(
-            self.nand_capacity_step_bytes > 0
-                && self.pretest_nand_capacity_bytes > 0
-                && self.pretest_nand_capacity_bytes <= MAXIMUM_SUPPORTED_CAPACITY_BYTES
-                && self.minimum_nand_capacity_bytes <= self.maximum_nand_capacity_bytes
-                && self.maximum_nand_capacity_bytes <= MAXIMUM_SUPPORTED_CAPACITY_BYTES,
-            "invalid pretest NAND capacity, NAND capacity step, or candidate range"
+            self.nand_capacity_step_bytes > 0,
+            "--nand-capacity-step must be greater than 0 bytes"
+        );
+        ensure!(
+            self.pretest_nand_capacity_bytes > 0
+                && self.pretest_nand_capacity_bytes <= MAXIMUM_SUPPORTED_CAPACITY_BYTES,
+            "--pretest-nand-capacity is {} bytes, expected 1 byte to 2 PiB",
+            self.pretest_nand_capacity_bytes
+        );
+        ensure!(
+            self.maximum_nand_capacity_bytes <= MAXIMUM_SUPPORTED_CAPACITY_BYTES,
+            "--maximum-nand-capacity is {} bytes, above the 2 PiB limit",
+            self.maximum_nand_capacity_bytes
+        );
+        ensure!(
+            self.minimum_nand_capacity_bytes <= self.maximum_nand_capacity_bytes,
+            "--minimum-nand-capacity ({} bytes) exceeds --maximum-nand-capacity ({} bytes)",
+            self.minimum_nand_capacity_bytes,
+            self.maximum_nand_capacity_bytes
         );
 
         let lower = self
             .minimum_nand_capacity_bytes
             .max(host_visible_capacity_bytes.saturating_add(1));
         let upper = self.maximum_nand_capacity_bytes;
+        ensure!(
+            lower <= upper,
+            "--maximum-nand-capacity ({upper} bytes) must exceed the device's host-visible capacity ({host_visible_capacity_bytes} bytes)"
+        );
         let remainder = self.pretest_nand_capacity_bytes % self.nand_capacity_step_bytes;
         let (gcd, inverse) = gcd_coefficient(
             self.nand_capacity_step_bytes.into(),
@@ -236,7 +276,9 @@ impl CapacityRange {
         );
         ensure!(
             i128::from(remainder) % gcd == 0,
-            "no capacity on the requested step grid aligns to logical blocks"
+            "no capacity reached from --pretest-nand-capacity ({} bytes) in steps of {} bytes can align to {logical_block_bytes}-byte logical blocks",
+            self.pretest_nand_capacity_bytes,
+            self.nand_capacity_step_bytes
         );
         // The starting remainder plus this many NAND capacity steps must be a
         // multiple of the logical block size.
@@ -254,7 +296,7 @@ impl CapacityRange {
                 * aligned_candidate_spacing_bytes;
         ensure!(
             first <= u128::from(upper),
-            "no legal NAND capacity in the requested range"
+            "the first aligned NAND capacity at or above {lower} bytes is {first} bytes, above --maximum-nand-capacity ({upper} bytes)"
         );
         let last_index = (u128::from(upper) - first) / aligned_candidate_spacing_bytes;
         // A spacing wider than the range means there is exactly one candidate.
@@ -285,7 +327,7 @@ impl CapacityRange {
     ) -> Result<Recommendation> {
         ensure!(
             target_seconds.is_finite() && target_seconds > 0.0,
-            "invalid wear target"
+            "target wear duration must be finite and positive, got {target_seconds} s"
         );
         let (first, aligned_candidate_spacing_bytes, last_index) =
             self.aligned_candidates(host_visible_capacity_bytes, logical_block_bytes)?;

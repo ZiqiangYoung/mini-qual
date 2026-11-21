@@ -114,7 +114,23 @@ impl Drop for RunLogFixture {
 }
 
 #[test]
-fn retention_reads_renamed_log_fields_and_emits_descriptive_report() -> anyhow::Result<()> {
+fn invalid_pe_explains_the_failed_unit_conversion() -> anyhow::Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_mini-qual"))
+        .args(["pretest", "--pe", "3.2505"])
+        .output()?;
+    let error = String::from_utf8(output.stderr)?;
+    assert!(!output.status.success());
+    assert!(error.contains("--pe"), "{error}");
+    assert!(error.contains("3.2505"), "{error}");
+    assert!(
+        error.contains("fractional after unit conversion"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn retention_uses_recorded_temperatures_and_reports_unusable_logs() -> anyhow::Result<()> {
     let path = std::env::temp_dir().join(format!("mini-qual-cli-{}", Uuid::new_v4()));
     fs::create_dir(&path)?;
     let log = RunLogFixture(path);
@@ -131,18 +147,16 @@ fn retention_reads_renamed_log_fields_and_emits_descriptive_report() -> anyhow::
             "\n",
         ),
     )?;
-    let output = Command::new(env!("CARGO_BIN_EXE_mini-qual"))
-        .args(["retention", "--log-dir"])
-        .arg(&log.0)
-        .args([
-            "--retention-baseline-temperature-c",
-            "40",
-            "--retention-baseline-duration-hours",
-            "101",
-            "--retention-test-temperature-c",
-            "40",
-        ])
-        .output()?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mini-qual"));
+    command.args(["retention", "--log-dir"]).arg(&log.0).args([
+        "--retention-baseline-temperature-c",
+        "40",
+        "--retention-baseline-duration-hours",
+        "101",
+        "--retention-test-temperature-c",
+        "40",
+    ]);
+    let output = command.output()?;
     assert!(
         output.status.success(),
         "{}",
@@ -165,5 +179,25 @@ fn retention_reads_renamed_log_fields_and_emits_descriptive_report() -> anyhow::
     );
     assert_eq!(report["parameters"]["retention_test_temperature_c"], 40.0);
     assert!(report["effective_endurance_temperature_c"].is_number());
+
+    let temperature_path = log.0.join("temperature.jsonl");
+    fs::write(
+        &temperature_path,
+        r#"{"query_time":"2026-11-21T00:00:00Z","completed_time":"2026-11-21T00:00:00Z","elapsed_seconds":0.0,"error":"case temperature GET returned HTTP 503 Service Unavailable"}"#,
+    )?;
+    let output = command.output()?;
+    let error = String::from_utf8(output.stderr)?;
+    assert!(!output.status.success());
+    assert!(
+        error.contains(&temperature_path.display().to_string()),
+        "{error}"
+    );
+    assert!(error.contains("HTTP 503 Service Unavailable"), "{error}");
+
+    fs::write(&temperature_path, "\ninvalid JSON\n")?;
+    let output = command.output()?;
+    let error = String::from_utf8(output.stderr)?;
+    assert!(!output.status.success());
+    assert!(error.contains("temperature record at line 1"), "{error}");
     Ok(())
 }

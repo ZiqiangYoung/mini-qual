@@ -136,5 +136,27 @@ fn sequential_io_preserves_aligned_tails_and_recovered_read_errors() -> Result<(
             "read 262144 4096 4096 32\n",
         )
     );
+
+    let error = fio
+        .write("pretest", 2, device.host_visible_capacity_bytes)
+        .expect_err("a failed fio write must exit the stage");
+    let message = format!("{error:#}");
+    assert!(message.contains("No space left on device"), "{message}");
+    assert!(message.contains("unused-device"), "{message}");
+    assert!(message.contains("byte offset 0"), "{message}");
+    assert!(
+        message.contains("pretest-round-000002-write.fio.stderr"),
+        "{message}"
+    );
+
+    let error = fio
+        .write("pretest", 3, device.host_visible_capacity_bytes)
+        .expect_err("fio startup errors must exit the stage");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot open namespace for writing: Permission denied"),
+        "{error:#}"
+    );
     Ok(())
 }

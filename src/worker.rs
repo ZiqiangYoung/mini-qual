@@ -135,7 +135,15 @@ impl RequestError {
 impl fmt::Display for RequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Transport(error) => write!(f, "HTTP transport error: {error}"),
+            Self::Transport(error) => {
+                write!(f, "{error}")?;
+                let mut cause = std::error::Error::source(error);
+                while let Some(error) = cause {
+                    write!(f, ": {error}")?;
+                    cause = error.source();
+                }
+                Ok(())
+            }
             Self::Http(status, Some(error)) => {
                 write!(f, "HTTP {status} ({}): {}", error.code, error.message)?;
                 if let Some(state) = error.current_state {
@@ -230,15 +238,20 @@ impl Session {
 
 struct Health {
     lease_expires_at: Instant,
+    last_heartbeat_error: Option<String>,
     terminal: Option<WorkerState>,
     failure: Option<String>,
 }
 
 impl Health {
-    fn expiry(&self, now: Instant) -> Option<&'static str> {
-        (now >= self.lease_expires_at).then_some(
-            "coordinator worker heartbeat lease could not be renewed before its deadline",
-        )
+    fn expiry(&self, now: Instant) -> Option<String> {
+        (now >= self.lease_expires_at).then(|| {
+            let message = "coordinator heartbeat lease expired without an acknowledged renewal";
+            match &self.last_heartbeat_error {
+                Some(error) => format!("{message}. Last heartbeat error: {error}"),
+                None => message.to_owned(),
+            }
+        })
     }
 }
 
@@ -255,10 +268,11 @@ fn remaining(deadline: Instant) -> Option<Duration> {
 }
 
 fn validate_endpoint(endpoint: &str) -> Result<String> {
-    let endpoint = Url::parse(endpoint).context("invalid coordinator endpoint")?;
+    let endpoint =
+        Url::parse(endpoint).context("invalid poweroff coordinator URL in --coordinator")?;
     ensure!(
         endpoint.scheme() == "http" && endpoint.has_host(),
-        "coordinator endpoint must use HTTP and include a host"
+        "--coordinator requires an HTTP URL with a host (e.g. http://127.0.0.1:17653)"
     );
     ensure!(
         endpoint.username().is_empty()
@@ -310,7 +324,7 @@ fn heartbeat(
         let timeout = {
             let mut health = lock_health(health);
             if let Some(reason) = health.expiry(sent_at) {
-                health.failure = Some(reason.to_owned());
+                health.failure = Some(reason);
                 stop.store(true, Ordering::Release);
                 return;
             }
@@ -323,17 +337,23 @@ fn heartbeat(
         let mut health = lock_health(health);
         match reply {
             Ok(status) if status.instance_id != session.instance_id => {
-                health.failure = Some("heartbeat returned a different instance ID".to_owned());
+                health.failure = Some(format!(
+                    "heartbeat returned instance {}, expected {}",
+                    status.instance_id, session.instance_id
+                ));
             }
             Ok(status) if status.state == WorkerState::Active => {
                 if let Some(expiry) = sent_at.checked_add(lease) {
                     health.lease_expires_at = expiry;
+                    health.last_heartbeat_error = None;
                 } else {
                     health.failure = Some("heartbeat lease is outside the timer range".to_owned());
                 }
             }
             Ok(status) => health.terminal = Some(status.state),
-            Err(error) if error.retryable() => {}
+            Err(error) if error.retryable() => {
+                health.last_heartbeat_error = Some(error.to_string())
+            }
             Err(error) => {
                 health.terminal = error.terminal_state();
                 health.failure = Some(format!("coordinator heartbeat failed: {error}"));
@@ -387,13 +407,18 @@ impl Worker {
         let registration_deadline = Instant::now() + RETRY_BUDGET;
         let mut backoff = INITIAL_BACKOFF;
         let mut first_delivered_request_at = None;
+        let mut last_request_error = None;
         let (registration, registered_at): (Registration, Instant) = loop {
             ensure!(
                 !stop.load(Ordering::Acquire),
                 "coordinator registration unconfirmed for worker {instance_id}: interrupted"
             );
             let timeout = remaining(registration_deadline).with_context(|| {
-                format!("coordinator registration unconfirmed for worker {instance_id}")
+                let message = format!("coordinator did not confirm registration of worker {instance_id} for run {run_id} within {} s", RETRY_BUDGET.as_secs());
+                match &last_request_error {
+                    Some(error) => format!("{message}. Last registration error: {error}"),
+                    None => message,
+                }
             })?;
             let sent_at = Instant::now();
             let reply = session.request(
@@ -412,11 +437,8 @@ impl Worker {
                     if error.could_have_reached_server() {
                         first_delivered_request_at.get_or_insert(sent_at);
                     }
-                    let time_left = remaining(registration_deadline).with_context(|| {
-                        format!(
-                            "coordinator registration unconfirmed for worker {instance_id}: {error}"
-                        )
-                    })?;
+                    last_request_error = Some(error);
+                    let time_left = registration_deadline.saturating_duration_since(Instant::now());
                     thread::sleep(cmp::min(backoff, time_left));
                     backoff = cmp::min(MAX_BACKOFF, backoff * 2);
                 }
@@ -427,8 +449,14 @@ impl Worker {
             }
         };
         ensure!(
-            registration.run_id == run_id && registration.instance_id == instance_id,
-            "coordinator registration returned mismatched run or instance ID"
+            registration.run_id == run_id,
+            "registration returned run {}, expected {run_id}",
+            registration.run_id
+        );
+        ensure!(
+            registration.instance_id == instance_id,
+            "registration returned instance {}, expected {instance_id}",
+            registration.instance_id
         );
         ensure!(
             registration.state == WorkerState::Active,
@@ -437,18 +465,22 @@ impl Worker {
         );
         ensure!(
             registration.task_timeout_ms.unwrap_or(0) == 0,
-            "coordinator reports a finite worker task timeout; disable it before starting endurance"
+            "coordinator reports a finite worker task timeout of {} ms. Disable the coordinator's task timeout before starting endurance (set --task-timeout 0 on the bundled coordinator)",
+            registration.task_timeout_ms.unwrap_or_default()
         );
         let timing = registration.timing;
         ensure!(
             timing.heartbeat_interval_ms > 0 && timing.heartbeat_timeout_ms > 0,
-            "coordinator returned a zero heartbeat interval or timeout"
+            "coordinator heartbeat interval ({} ms) and timeout ({} ms) must both be positive",
+            timing.heartbeat_interval_ms,
+            timing.heartbeat_timeout_ms
         );
         let lease_expires_at = registered_at
             .checked_add(Duration::from_millis(timing.heartbeat_timeout_ms))
             .context("coordinator heartbeat lease is outside the timer range")?;
         let health = Arc::new(Mutex::new(Health {
             lease_expires_at,
+            last_heartbeat_error: None,
             terminal: None,
             failure: None,
         }));
@@ -514,6 +546,7 @@ impl Worker {
         }
         let deadline = Instant::now() + RETRY_BUDGET;
         let mut backoff = INITIAL_BACKOFF;
+        let mut last_request_error = None;
         let reason = loop {
             let health = lock_health(&self.health);
             if let Some(state) = health.terminal {
@@ -529,7 +562,18 @@ impl Worker {
                 break failure;
             }
             let Some(timeout) = remaining(send_deadline) else {
-                break "coordinator completion deadline reached".to_owned();
+                let message = if send_deadline == deadline {
+                    format!(
+                        "coordinator did not acknowledge the completion report within {} s",
+                        RETRY_BUDGET.as_secs()
+                    )
+                } else {
+                    "coordinator heartbeat lease expired before the completion report was acknowledged".to_owned()
+                };
+                break match &last_request_error {
+                    Some(error) => format!("{message}. Last completion request error: {error}"),
+                    None => message,
+                };
             };
             match self
                 .session
@@ -538,11 +582,15 @@ impl Worker {
                 Ok(status) if status.instance_id == self.session.instance_id => {
                     return confirm_state(outcome, status.state);
                 }
-                Ok(_) => break "completion returned a different instance ID".to_owned(),
+                Ok(status) => {
+                    break format!(
+                        "completion returned instance {}, expected {}",
+                        status.instance_id, self.session.instance_id
+                    );
+                }
                 Err(error) if error.retryable() => {
-                    let Some(time_left) = remaining(deadline) else {
-                        break error.to_string();
-                    };
+                    last_request_error = Some(error);
+                    let time_left = deadline.saturating_duration_since(Instant::now());
                     thread::sleep(cmp::min(backoff, time_left));
                     backoff = cmp::min(MAX_BACKOFF, backoff * 2);
                 }
@@ -588,14 +636,24 @@ impl Worker {
                     if worker.state != WorkerState::Active {
                         return confirm_state(outcome, worker.state);
                     }
+                    bail!(
+                        "coordinator still lists worker {} as active. Completion remains unconfirmed. {reason}",
+                        self.session.instance_id
+                    );
                 }
-                bail!("coordinator completion unconfirmed: {reason}");
+                bail!(
+                    "coordinator status for run {} does not list worker {}. Completion remains unconfirmed. {reason}",
+                    self.session.run_id,
+                    self.session.instance_id
+                );
             }
-            Ok(_) => bail!(
-                "coordinator completion unconfirmed: {reason}; status returned a different run ID"
+            Ok(status) => bail!(
+                "coordinator status returned run {}, expected {} while confirming completion. {reason}",
+                status.run_id,
+                self.session.run_id
             ),
             Err(error) => Err(anyhow!(
-                "coordinator completion unconfirmed: {reason}; status query failed: {error}"
+                "coordinator completion remains unconfirmed. {reason}. The status query also failed: {error}"
             )),
         }
     }
@@ -609,8 +667,11 @@ fn confirm_state(outcome: Outcome, state: WorkerState) -> Result<()> {
         WorkerState::Succeeded | WorkerState::Failed => {
             bail!("coordinator completion conflict: expected {outcome:?}, recorded {state:?}");
         }
-        WorkerState::Lost | WorkerState::TimedOut => {
-            bail!("coordinator released the worker before completion: {state:?}");
+        WorkerState::Lost => bail!(
+            "coordinator marked the worker lost because its heartbeat lease expired before completion"
+        ),
+        WorkerState::TimedOut => {
+            bail!("coordinator reported that its worker task time limit elapsed before completion")
         }
         WorkerState::Active | WorkerState::Unknown => {
             bail!("coordinator completion unconfirmed: worker state {state:?}");

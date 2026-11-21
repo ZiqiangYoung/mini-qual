@@ -57,7 +57,7 @@ impl Device {
         let logical_block_bytes = read_number(&namespace.join("queue/logical_block_size"))?;
         ensure!(
             logical_block_bytes >= 512 && logical_block_bytes.is_power_of_two(),
-            "invalid logical block size {logical_block_bytes} for {}",
+            "{} reports a logical block size of {logical_block_bytes} bytes, expected a power of two of at least 512 bytes",
             path.display()
         );
         let host_visible_capacity_bytes = volume_bytes(&namespace, logical_block_bytes)?;
@@ -85,18 +85,37 @@ impl Device {
         let file = self.open(true, 0)?;
         // SAFETY: The live File owns this descriptor. flock does not take a pointer.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(io::Error::last_os_error()).with_context(|| {
-                format!("could not exclusively lock device {}", self.path.display())
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Err(error).with_context(|| {
+                    format!(
+                        "another process already holds an incompatible lock on {}",
+                        self.path.display()
+                    )
+                });
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "acquiring the exclusive trial lock on {}",
+                    self.path.display()
+                )
             });
         }
         let targets = self.targets()?;
-        let partially_inspected_pids = check_processes(Path::new("/proc"), &targets)?;
+        let partially_inspected_pids =
+            check_processes(Path::new("/proc"), &targets).with_context(|| {
+                format!(
+                    "checking current-user use of {} (SN {})",
+                    self.path.display(),
+                    self.serial
+                )
+            })?;
         self.check_ready()?;
         // A whole-device exclusive open detects kernel claims on it or its partitions.
         // Close the probe before fio's nonexclusive descriptor issues BLKDISCARD.
         self.open(true, libc::O_EXCL).with_context(|| {
             format!(
-                "checking for a mount, swap, or other exclusive use of {}",
+                "checking exclusive access to {} and its partitions (including kernel users such as mounts or swap)",
                 self.path.display()
             )
         })?;
@@ -108,10 +127,12 @@ impl Device {
 
     /// Checks identity without waiting for a resetting controller.
     pub fn check_present(&self) -> Result<()> {
+        let current_serial = read_string(&self.controller.join("serial"))?;
         ensure!(
-            read_string(&self.controller.join("serial"))? == self.serial,
-            "controller serial changed for {}",
-            self.path.display()
+            current_serial == self.serial,
+            "{} now has SN {current_serial:?}, expected {:?}",
+            self.path.display(),
+            self.serial
         );
         check_device_node(&self.path, self.device_id)?;
         ensure!(
@@ -130,27 +151,39 @@ impl Device {
                 break;
             }
             ensure!(
-                matches!(state.as_str(), "new" | "resetting" | "connecting")
-                    && start.elapsed() < RECOVERY_TIMEOUT,
-                "controller for {} is {state}",
+                matches!(state.as_str(), "new" | "resetting" | "connecting"),
+                "NVMe controller for {} is {state:?}, so it cannot accept I/O",
                 self.path.display()
+            );
+            ensure!(
+                start.elapsed() < RECOVERY_TIMEOUT,
+                "NVMe controller for {} is still {state:?} after waiting {} s for recovery",
+                self.path.display(),
+                RECOVERY_TIMEOUT.as_secs()
             );
             thread::sleep(Duration::from_millis(250));
         }
 
         self.check_present()?;
+        let namespace_id = read_number(&self.namespace.join("nsid"))?;
         ensure!(
-            read_number(&self.namespace.join("nsid"))? == u64::from(NAMESPACE_ID),
-            "namespace ID changed for {}",
+            namespace_id == u64::from(NAMESPACE_ID),
+            "{} now reports NSID {namespace_id}, expected NSID {NAMESPACE_ID}",
             self.path.display()
         );
+        let logical_block_bytes = read_number(&self.namespace.join("queue/logical_block_size"))?;
         ensure!(
-            read_number(&self.namespace.join("queue/logical_block_size"))?
-                == self.logical_block_bytes
-                && volume_bytes(&self.namespace, self.logical_block_bytes)?
-                    == self.host_visible_capacity_bytes,
-            "namespace geometry changed for {}",
-            self.path.display()
+            logical_block_bytes == self.logical_block_bytes,
+            "the logical block size of {} changed from {} to {logical_block_bytes} bytes",
+            self.path.display(),
+            self.logical_block_bytes
+        );
+        let capacity = volume_bytes(&self.namespace, logical_block_bytes)?;
+        ensure!(
+            capacity == self.host_visible_capacity_bytes,
+            "the host-visible capacity of {} changed from {} to {capacity} bytes",
+            self.path.display(),
+            self.host_visible_capacity_bytes
         );
         ensure!(
             read_number(&self.namespace.join("ro"))? == 0,
@@ -215,7 +248,17 @@ impl Device {
             .write(write)
             .custom_flags(flags | libc::O_NOFOLLOW)
             .open(&self.path)
-            .with_context(|| format!("opening block device {}", self.path.display()))?;
+            .with_context(|| {
+                format!(
+                    "opening block device {} for {}",
+                    self.path.display(),
+                    if write {
+                        "reading and writing"
+                    } else {
+                        "reading"
+                    }
+                )
+            })?;
         ensure!(
             self.device_id.matches(&file.metadata()?),
             "block device changed while opening {}",
@@ -378,7 +421,7 @@ fn find_controller(class: &Path, serial: &str) -> Result<PathBuf> {
             matched = Some(entry.path());
         }
     }
-    matched.with_context(|| format!("no NVMe controller found with serial {serial}"))
+    matched.with_context(|| format!("no attached NVMe controller has --sn {serial:?}"))
 }
 
 fn find_namespace(controller: &Path, subsystems: &Path) -> Result<PathBuf> {
@@ -395,14 +438,24 @@ fn find_namespace(controller: &Path, subsystems: &Path) -> Result<PathBuf> {
         }
     }
     ensure!(
-        namespaces.len() == 1
-            && read_number(&namespaces[0].join("nsid"))? == u64::from(NAMESPACE_ID)
-            && optional_number(&namespaces[0].join("hidden"))? != Some(1),
-        "{} must expose exactly one block namespace with NSID 1 (found {})",
+        namespaces.len() == 1,
+        "{} exposes {} block namespaces, expected exactly one with NSID {NAMESPACE_ID}",
         controller.display(),
         namespaces.len()
     );
-    Ok(namespaces.remove(0))
+    let namespace = namespaces.remove(0);
+    let namespace_id = read_number(&namespace.join("nsid"))?;
+    ensure!(
+        namespace_id == u64::from(NAMESPACE_ID),
+        "{} exposes NSID {namespace_id}, expected NSID {NAMESPACE_ID}",
+        controller.display()
+    );
+    ensure!(
+        optional_number(&namespace.join("hidden"))? != Some(1),
+        "{} exposes only a hidden path for NSID {NAMESPACE_ID}. No usable block namespace was found",
+        controller.display()
+    );
+    Ok(namespace)
 }
 
 fn namespace_list(parent: &Path) -> Result<Vec<PathBuf>> {
@@ -448,7 +501,8 @@ fn volume_bytes(namespace: &Path, logical_block_bytes: u64) -> Result<u64> {
         .context("namespace capacity exceeds u64")?;
     ensure!(
         size > 0 && size % logical_block_bytes == 0,
-        "namespace capacity {size} is not a positive multiple of {logical_block_bytes}"
+        "{} reports {size} bytes of capacity, expected a positive multiple of its {logical_block_bytes}-byte logical block size",
+        namespace.display()
     );
     Ok(size)
 }
@@ -500,11 +554,20 @@ fn read_device_id(path: &Path, kind: DeviceKind) -> Result<DeviceId> {
 
 fn check_device_node(path: &Path, id: DeviceId) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("checking block device node {}", path.display()))?;
+        .with_context(|| format!("locating the NVMe block device node {}", path.display()))?;
+    ensure!(
+        metadata.file_type().is_block_device(),
+        "{} is not an NVMe block device node",
+        path.display()
+    );
     ensure!(
         id.matches(&metadata),
-        "device node identity changed at {}",
-        path.display()
+        "{} has device number {}:{}, expected {}:{} from sysfs",
+        path.display(),
+        libc::major(metadata.rdev()),
+        libc::minor(metadata.rdev()),
+        libc::major(id.number),
+        libc::minor(id.number)
     );
     Ok(())
 }

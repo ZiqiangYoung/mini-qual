@@ -20,6 +20,7 @@ const MAX_TRIM_BYTES: u64 = 64 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const INTERRUPT_GRACE: Duration = Duration::from_secs(3);
+const DIAGNOSTIC_PREFIX_BYTES: u64 = 4096;
 
 #[derive(Debug, Default)]
 pub struct Stage {
@@ -132,11 +133,19 @@ impl<'a> Fio<'a> {
             .command()
             .arg("--version")
             .output()
-            .context("starting fio --version")?;
+            .with_context(|| format!("running {} --version", fio.program.display()))?;
         ensure!(
-            version.status.success() && version.stdout.starts_with(b"fio-"),
-            "{} is not the Flexible I/O Tester",
-            fio.program.display()
+            version.status.success(),
+            "{} --version returned {}. {}",
+            fio.program.display(),
+            version.status,
+            diagnostic_line(&version.stderr).unwrap_or_else(|| "no message on stderr".into())
+        );
+        ensure!(
+            version.stdout.starts_with(b"fio-"),
+            "{} --version did not identify the Flexible I/O Tester. Expected output beginning with 'fio-', got {}",
+            fio.program.display(),
+            diagnostic_line(&version.stdout).unwrap_or_else(|| "empty output".into())
         );
         let mut version_log = create_log(&fio.output.join("fio-version.txt"))?;
         version_log
@@ -147,16 +156,27 @@ impl<'a> Fio<'a> {
             .command()
             .arg("--enghelp=libaio")
             .output()
-            .context("checking fio libaio support")?;
+            .with_context(|| {
+                format!(
+                    "checking libaio support with {} --enghelp=libaio",
+                    fio.program.display()
+                )
+            })?;
         ensure!(
             engine.status.success(),
-            "{} does not provide the libaio I/O engine: {}",
+            "{} --enghelp=libaio returned {}. {}",
             fio.program.display(),
-            String::from_utf8_lossy(&engine.stderr).trim()
+            engine.status,
+            diagnostic_line(&engine.stderr).unwrap_or_else(|| {
+                "the selected fio binary could not start its libaio engine".into()
+            })
         );
         ensure!(
             device.maximum_discard_request_bytes >= device.logical_block_bytes,
-            "the namespace does not advertise usable discard support"
+            "{} reports a maximum discard request of {} bytes, smaller than its {}-byte logical block. The trial requires TRIM",
+            device.path.display(),
+            device.maximum_discard_request_bytes,
+            device.logical_block_bytes
         );
         Ok(fio)
     }
@@ -280,8 +300,11 @@ impl<'a> Fio<'a> {
             bytes > 0
                 && bytes <= self.device.host_visible_capacity_bytes
                 && bytes % self.device.logical_block_bytes == 0,
-            "{} range is outside the namespace or not LBA-aligned",
-            operation.name()
+            "{} requested {bytes} bytes on {}. The length must be positive, at most {} bytes, and a multiple of {} bytes",
+            operation.name(),
+            self.device.path.display(),
+            self.device.host_visible_capacity_bytes,
+            self.device.logical_block_bytes
         );
         let start = Instant::now();
         let remainder = bytes % block_bytes;
@@ -370,9 +393,13 @@ impl<'a> Fio<'a> {
 
         self.ensure_running()?;
         let start = Instant::now();
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("starting fio {prefix}"))?;
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "starting {} for job {prefix} on {}",
+                self.program.display(),
+                self.device.path.display()
+            )
+        })?;
         let stderr = child.stderr.take().expect("fio stderr is piped");
         let (status, failed) = thread::scope(|scope| {
             let collector = scope.spawn(|| {
@@ -400,46 +427,77 @@ impl<'a> Fio<'a> {
             [&stdout_path, &stderr_path, &error_path],
             &self.output.join(format!("{prefix}_bw.1.log")),
         );
-        let status = status.with_context(|| format!("{prefix}; see {}", stderr_path.display()))?;
-        let failed = failed.with_context(|| format!("recording errors for {prefix}"))?;
-        saved?;
-
+        let status = status.with_context(|| {
+            format!(
+                "waiting for fio job {prefix} (stderr log {})",
+                stderr_path.display()
+            )
+        })?;
         let report = read_report(&stdout_path);
         ensure!(
             status.success(),
-            "fio {prefix} failed with {status}; job errno {:?}; see {}",
-            report
-                .as_ref()
-                .ok()
-                .and_then(|report| report["error"].as_u64()),
-            stderr_path.display()
+            "fio job {prefix} on {} returned {status} at byte offset {} with a requested length of {} bytes. {} Logs: {} and {}",
+            self.device.path.display(),
+            region.offset,
+            region.bytes,
+            fio_failure_detail(
+                &stderr_path,
+                report
+                    .as_ref()
+                    .ok()
+                    .and_then(|report| report["error"].as_u64())
+            ),
+            stderr_path.display(),
+            stdout_path.display()
         );
+        let failed = failed.with_context(|| {
+            format!(
+                "recording errors for fio job {prefix} (stderr log {})",
+                stderr_path.display()
+            )
+        })?;
+        saved?;
         let report = report?;
-        let job_errno = report["error"]
-            .as_u64()
-            .context("fio JSON missing job errno")?;
-        let successful_bytes = report[operation.name()]["io_bytes"]
-            .as_u64()
-            .context("fio JSON missing operation byte count")?;
+        let job_errno = report["error"].as_u64().with_context(|| {
+            format!(
+                "fio report {} is missing the integer jobs[0].error field",
+                stdout_path.display()
+            )
+        })?;
+        let successful_bytes =
+            report[operation.name()]["io_bytes"]
+                .as_u64()
+                .with_context(|| {
+                    format!(
+                        "fio report {} is missing the integer jobs[0].{}.io_bytes field",
+                        stdout_path.display(),
+                        operation.name()
+                    )
+                })?;
         if operation == Operation::Read {
             let total_errors = report["total_err"]
                 .as_u64()
-                .context("fio JSON missing read error count")?;
+                .with_context(|| format!("fio report {} is missing the integer jobs[0].total_err field required to verify read coverage", stdout_path.display()))?;
             ensure!(
                 failed.count == total_errors,
-                "fio {prefix} reported {total_errors} errors but recorded {} address ranges (job errno {job_errno}); see {}",
+                "fio job {prefix} reported {total_errors} read errors but logged {} failed address ranges (job errno {job_errno}). The unreadable ranges cannot be verified from {}",
                 failed.count,
                 stderr_path.display()
             );
             // With continue-on-error, fio uses the first read errno as the job's error field.
             ensure!(
                 job_errno == 0 || failed.count > 0,
-                "fio {prefix} reported unlocalized job errno {job_errno}"
+                "fio job {prefix} failed without reporting a failed read range. {} Log: {}",
+                fio_failure_detail(&stderr_path, Some(job_errno)),
+                stderr_path.display()
             );
         } else {
             ensure!(
                 job_errno == 0 && failed.count == 0,
-                "fio {prefix} failed with errno {job_errno}"
+                "fio job {prefix} reported {} failed requests. {} Log: {}",
+                failed.count,
+                fio_failure_detail(&stderr_path, Some(job_errno)),
+                stderr_path.display()
             );
         }
         ensure!(
@@ -504,6 +562,32 @@ fn read_error_option() -> String {
 
 fn create_log(path: &Path) -> Result<File> {
     File::create_new(path).with_context(|| format!("creating {}", path.display()))
+}
+
+fn diagnostic_line(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(300).collect())
+}
+
+fn fio_failure_detail(stderr_path: &Path, job_errno: Option<u64>) -> String {
+    let mut stderr = Vec::new();
+    if let Ok(file) = File::open(stderr_path) {
+        let _ = file.take(DIAGNOSTIC_PREFIX_BYTES).read_to_end(&mut stderr);
+    }
+    let stderr_message = diagnostic_line(&stderr);
+    let job_message = job_errno.filter(|errno| *errno > 0).map(|errno| {
+        i32::try_from(errno)
+            .map(|errno| io::Error::from_raw_os_error(errno).to_string())
+            .unwrap_or_else(|_| format!("fio reported job errno {errno}"))
+    });
+    match (stderr_message, job_message) {
+        (Some(stderr), Some(job)) => format!("{stderr} (fio job error: {job})"),
+        (Some(message), None) | (None, Some(message)) => message,
+        _ => "fio provided neither a message on stderr nor a job errno.".into(),
+    }
 }
 
 fn sync_fio_logs(paths: [&Path; 3], bandwidth: &Path) -> Result<()> {
