@@ -1,43 +1,43 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-pub const WEAR_TARGET_C: f64 = 76.5;
-pub const WEAR_TARGET_SECONDS: f64 = 1200.0 * 3600.0;
-pub const WEAR_ACTIVATION_EV: f64 = 1.1;
-pub const RETENTION_ACTIVATION_EV: f64 = 0.8;
-const BOLTZMANN_EV_PER_K: f64 = 8.617_1e-5;
-const CELSIUS_ZERO_KELVIN: f64 = 273.15;
+pub const ENDURANCE_REFERENCE_TEMPERATURE_C: f64 = 76.5;
+pub const ENDURANCE_REFERENCE_DURATION_SECONDS: f64 = 1200.0 * 3600.0;
+pub const ENDURANCE_ACTIVATION_ENERGY_EV: f64 = 1.1;
+pub const RETENTION_ACTIVATION_ENERGY_EV: f64 = 0.8;
+const BOLTZMANN_CONSTANT_EV_PER_KELVIN: f64 = 8.617_1e-5;
+const CELSIUS_TO_KELVIN_OFFSET: f64 = 273.15;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct WearWindow {
     pub start_seconds: f64,
     pub end_seconds: f64,
-    pub sample_interval_seconds: f64,
+    pub temperature_sample_interval_seconds: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Sample {
     pub elapsed_seconds: f64,
-    pub temperature_c: f64,
+    pub measured_case_temperature_c: f64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct RetentionParameters {
-    pub baseline_temp_c: f64,
-    pub baseline_hours: f64,
-    pub retention_temp_c: f64,
+    pub retention_baseline_temperature_c: f64,
+    pub retention_baseline_duration_hours: f64,
+    pub retention_test_temperature_c: f64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RetentionEstimate {
     pub parameters: RetentionParameters,
-    pub wear_reference_c: f64,
-    pub wear_reference_hours: f64,
-    pub wear_activation_ev: f64,
-    pub retention_activation_ev: f64,
+    pub endurance_reference_temperature_c: f64,
+    pub endurance_reference_duration_hours: f64,
+    pub endurance_activation_energy_ev: f64,
+    pub retention_activation_energy_ev: f64,
     pub wear_elapsed_hours: f64,
     pub wear_equivalent_hours_at_reference: f64,
-    pub wear_effective_c: f64,
+    pub effective_endurance_temperature_c: f64,
     pub wear_adjustment_before_floor: f64,
     pub wear_adjustment: f64,
     pub retention_temperature_factor: f64,
@@ -48,22 +48,28 @@ pub struct RetentionEstimate {
 
 pub fn temperature(value: f64) -> Result<f64> {
     ensure!(
-        value.is_finite() && value > -CELSIUS_ZERO_KELVIN,
+        value.is_finite() && value > -CELSIUS_TO_KELVIN_OFFSET,
         "temperature in °C must be finite and above absolute zero"
     );
     Ok(value)
 }
 
-fn acceleration(value_c: f64, reference_c: f64, activation_ev: f64) -> f64 {
-    let reference_k = reference_c + CELSIUS_ZERO_KELVIN;
-    let value_k = value_c + CELSIUS_ZERO_KELVIN;
-    (activation_ev / BOLTZMANN_EV_PER_K * (1.0 / reference_k - 1.0 / value_k)).exp()
+fn acceleration(
+    comparison_temperature_c: f64,
+    reference_temperature_c: f64,
+    activation_energy_ev: f64,
+) -> f64 {
+    let reference_temperature_kelvin = reference_temperature_c + CELSIUS_TO_KELVIN_OFFSET;
+    let comparison_temperature_kelvin = comparison_temperature_c + CELSIUS_TO_KELVIN_OFFSET;
+    (activation_energy_ev / BOLTZMANN_CONSTANT_EV_PER_KELVIN
+        * (1.0 / reference_temperature_kelvin - 1.0 / comparison_temperature_kelvin))
+        .exp()
 }
 
 pub fn equivalent_wear_seconds(window: WearWindow, samples: &[Sample]) -> Result<f64> {
     let start = window.start_seconds;
     let end = window.end_seconds;
-    let maximum_gap = 3.0 * window.sample_interval_seconds;
+    let maximum_gap = 3.0 * window.temperature_sample_interval_seconds;
     ensure!(
         start.is_finite()
             && end.is_finite()
@@ -81,15 +87,21 @@ pub fn equivalent_wear_seconds(window: WearWindow, samples: &[Sample]) -> Result
     ensure!(
         samples
             .iter()
-            .all(|s| s.elapsed_seconds.is_finite() && temperature(s.temperature_c).is_ok())
+            .all(|sample| sample.elapsed_seconds.is_finite()
+                && temperature(sample.measured_case_temperature_c).is_ok())
             && samples
                 .windows(2)
                 .all(|pair| pair[0].elapsed_seconds < pair[1].elapsed_seconds),
         "invalid case temperature timeline"
     );
 
-    let rate =
-        |sample: &Sample| acceleration(sample.temperature_c, WEAR_TARGET_C, WEAR_ACTIVATION_EV);
+    let rate = |sample: &Sample| {
+        acceleration(
+            sample.measured_case_temperature_c,
+            ENDURANCE_REFERENCE_TEMPERATURE_C,
+            ENDURANCE_ACTIVATION_ENERGY_EV,
+        )
+    };
     let mut equivalent = 0.0;
     if start < first.elapsed_seconds {
         ensure!(
@@ -133,10 +145,11 @@ pub fn equivalent_wear_seconds(window: WearWindow, samples: &[Sample]) -> Result
 
 impl RetentionParameters {
     pub fn validate(self) -> Result<()> {
-        temperature(self.baseline_temp_c)?;
-        temperature(self.retention_temp_c)?;
+        temperature(self.retention_baseline_temperature_c)?;
+        temperature(self.retention_test_temperature_c)?;
         ensure!(
-            self.baseline_hours.is_finite() && self.baseline_hours > 0.0,
+            self.retention_baseline_duration_hours.is_finite()
+                && self.retention_baseline_duration_hours > 0.0,
             "baseline retention hours must be finite and positive"
         );
         Ok(())
@@ -146,38 +159,42 @@ impl RetentionParameters {
         self.validate()?;
         let equivalent = equivalent_wear_seconds(window, samples)?;
         let elapsed = window.end_seconds - window.start_seconds;
-        let wear_adjustment_before_floor = equivalent / WEAR_TARGET_SECONDS;
+        let wear_adjustment_before_floor = equivalent / ENDURANCE_REFERENCE_DURATION_SECONDS;
         let wear_adjustment = wear_adjustment_before_floor.max(0.5);
         let retention_temperature_factor = acceleration(
-            self.retention_temp_c,
-            self.baseline_temp_c,
-            RETENTION_ACTIVATION_EV,
+            self.retention_test_temperature_c,
+            self.retention_baseline_temperature_c,
+            RETENTION_ACTIVATION_ENERGY_EV,
         );
         let recommended_hours =
-            self.baseline_hours * wear_adjustment / retention_temperature_factor;
+            self.retention_baseline_duration_hours * wear_adjustment / retention_temperature_factor;
         ensure!(
             retention_temperature_factor.is_finite()
                 && recommended_hours.is_finite()
                 && recommended_hours > 0.0,
             "retention temperatures or duration are outside the calculation range"
         );
-        let inverse_effective_k = 1.0 / (WEAR_TARGET_C + CELSIUS_ZERO_KELVIN)
-            - (equivalent / elapsed).ln() * BOLTZMANN_EV_PER_K / WEAR_ACTIVATION_EV;
+        let reciprocal_effective_kelvin = 1.0
+            / (ENDURANCE_REFERENCE_TEMPERATURE_C + CELSIUS_TO_KELVIN_OFFSET)
+            - (equivalent / elapsed).ln() * BOLTZMANN_CONSTANT_EV_PER_KELVIN
+                / ENDURANCE_ACTIVATION_ENERGY_EV;
         Ok(RetentionEstimate {
             parameters: self,
-            wear_reference_c: WEAR_TARGET_C,
-            wear_reference_hours: WEAR_TARGET_SECONDS / 3600.0,
-            wear_activation_ev: WEAR_ACTIVATION_EV,
-            retention_activation_ev: RETENTION_ACTIVATION_EV,
+            endurance_reference_temperature_c: ENDURANCE_REFERENCE_TEMPERATURE_C,
+            endurance_reference_duration_hours: ENDURANCE_REFERENCE_DURATION_SECONDS / 3600.0,
+            endurance_activation_energy_ev: ENDURANCE_ACTIVATION_ENERGY_EV,
+            retention_activation_energy_ev: RETENTION_ACTIVATION_ENERGY_EV,
             wear_elapsed_hours: elapsed / 3600.0,
             wear_equivalent_hours_at_reference: equivalent / 3600.0,
-            wear_effective_c: 1.0 / inverse_effective_k - CELSIUS_ZERO_KELVIN,
+            effective_endurance_temperature_c: 1.0 / reciprocal_effective_kelvin
+                - CELSIUS_TO_KELVIN_OFFSET,
             wear_adjustment_before_floor,
             wear_adjustment,
             retention_temperature_factor,
             recommended_hours,
             successful_temperature_samples: samples.len(),
-            maximum_accepted_temperature_gap_seconds: 3.0 * window.sample_interval_seconds,
+            maximum_accepted_temperature_gap_seconds: 3.0
+                * window.temperature_sample_interval_seconds,
         })
     }
 }

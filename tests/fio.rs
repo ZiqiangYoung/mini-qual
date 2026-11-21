@@ -27,9 +27,9 @@ mod device {
 
     pub struct Device {
         pub path: PathBuf,
-        pub size_bytes: u64,
+        pub host_visible_capacity_bytes: u64,
         pub logical_block_bytes: u64,
-        pub discard_max_bytes: u64,
+        pub maximum_discard_request_bytes: u64,
     }
 
     impl Device {
@@ -88,18 +88,18 @@ fn sequential_io_preserves_aligned_tails_and_recovered_read_errors() -> Result<(
 
     let device = Device {
         path: directory.0.join("unused-device"),
-        size_bytes: 266240,
+        host_visible_capacity_bytes: 266240,
         logical_block_bytes: 4096,
-        discard_max_bytes: 262144,
+        maximum_discard_request_bytes: 262144,
     };
     let stop = AtomicBool::new(false);
     let fio = Fio::new(program, directory.0.clone(), &device, &stop)?;
     let trim = fio.trim("pretest", 1)?;
-    assert_eq!(trim.successful_bytes, device.size_bytes);
-    let write = fio.write("pretest", 1, device.size_bytes)?;
-    assert_eq!(write.successful_bytes, device.size_bytes);
-    let read = fio.read("pretest", 1, device.size_bytes)?;
-    assert_eq!(read.attempted_bytes, device.size_bytes);
+    assert_eq!(trim.successful_bytes, device.host_visible_capacity_bytes);
+    let write = fio.write("pretest", 1, device.host_visible_capacity_bytes)?;
+    assert_eq!(write.successful_bytes, device.host_visible_capacity_bytes);
+    let read = fio.read("pretest", 1, device.host_visible_capacity_bytes)?;
+    assert_eq!(read.attempted_bytes, device.host_visible_capacity_bytes);
     assert_eq!(read.successful_bytes, 4096);
     assert_eq!(read.errors, 2);
     let locate = fio.locate("pretest", 1)?;

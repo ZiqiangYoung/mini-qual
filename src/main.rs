@@ -65,28 +65,28 @@ struct DeviceArgs {
     temperature_pointer: Option<String>,
     /// 温度查询间隔，单位秒
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=86400))]
-    temperature_interval_secs: u64,
+    temperature_sample_interval_seconds: u64,
 }
 
 #[derive(Args)]
 struct RetentionConditions {
     /// retention 基准保存温度，单位 °C
     #[arg(long, allow_negative_numbers = true)]
-    baseline_temp_c: f64,
+    retention_baseline_temperature_c: f64,
     /// retention 基准保存时长，单位小时
     #[arg(long)]
-    baseline_hours: f64,
+    retention_baseline_duration_hours: f64,
     /// 实际断电 retention 温度，单位 °C
     #[arg(long, allow_negative_numbers = true)]
-    retention_temp_c: f64,
+    retention_test_temperature_c: f64,
 }
 
 impl From<&RetentionConditions> for RetentionParameters {
     fn from(value: &RetentionConditions) -> Self {
         Self {
-            baseline_temp_c: value.baseline_temp_c,
-            baseline_hours: value.baseline_hours,
-            retention_temp_c: value.retention_temp_c,
+            retention_baseline_temperature_c: value.retention_baseline_temperature_c,
+            retention_baseline_duration_hours: value.retention_baseline_duration_hours,
+            retention_test_temperature_c: value.retention_test_temperature_c,
         }
     }
 }
@@ -95,9 +95,9 @@ impl From<&RetentionConditions> for RetentionParameters {
 struct RunArgs {
     #[command(flatten)]
     device: DeviceArgs,
-    /// 已烧录的实际 NAND 物理容量 P
+    /// 正式试验盘已烧录的 NAND 物理容量
     #[arg(long, value_parser = plan::parse_capacity)]
-    physical_capacity: u64,
+    nand_capacity: u64,
     #[command(flatten)]
     retention: RetentionConditions,
     /// 部署方指定的断电协调批次 UUID
@@ -106,27 +106,27 @@ struct RunArgs {
     /// 断电协调服务 HTTP 地址
     #[arg(long, default_value = "http://127.0.0.1:17653")]
     coordinator: String,
-    /// 断电协调任务总超时，单位毫秒；省略使用服务端设置
+    /// 断电协调任务总超时，单位毫秒。省略时使用服务端设置
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-    task_timeout_ms: Option<u64>,
+    coordinator_task_timeout_ms: Option<u64>,
 }
 
 #[derive(Args)]
 struct PretestArgs {
     #[command(flatten)]
     device: DeviceArgs,
-    /// 预测试盘已配置的 NAND 物理容量，也是容量步进的参考 P_ref
+    /// 预测试盘当前烧录的 NAND 物理容量，用作候选容量的步进起点
     #[arg(long, value_parser = plan::parse_capacity)]
-    reference_capacity: u64,
-    /// 相对于 P_ref 的容量步长 S
+    pretest_nand_capacity: u64,
+    /// 从预测试盘当前 NAND 容量向上或向下调整时每档的字节差
     #[arg(long, value_parser = plan::parse_capacity)]
-    capacity_step: u64,
-    /// 候选物理容量下限
+    nand_capacity_step: u64,
+    /// 候选 NAND 物理容量下限
     #[arg(long, value_parser = plan::parse_capacity)]
-    min_capacity: u64,
-    /// 候选物理容量上限
+    minimum_nand_capacity: u64,
+    /// 候选 NAND 物理容量上限
     #[arg(long, value_parser = plan::parse_capacity)]
-    max_capacity: u64,
+    maximum_nand_capacity: u64,
 }
 
 #[derive(Args)]
@@ -196,17 +196,17 @@ fn open_log(
             "command": command,
             "serial": device.serial,
             "device": device.path,
-            "host_bytes": device.size_bytes,
+            "host_visible_capacity_bytes": device.host_visible_capacity_bytes,
             "logical_block_bytes": device.logical_block_bytes,
             "pe": args.pe,
             "fio": args.fio,
             "temperature_url": args.temperature_url,
             "temperature_pointer": args.temperature_pointer,
-            "temperature_interval_seconds": args.temperature_interval_secs,
-            "wear_reference_c": thermal::WEAR_TARGET_C,
-            "wear_reference_seconds": thermal::WEAR_TARGET_SECONDS,
-            "wear_activation_ev": thermal::WEAR_ACTIVATION_EV,
-            "retention_activation_ev": thermal::RETENTION_ACTIVATION_EV,
+            "temperature_sample_interval_seconds": args.temperature_sample_interval_seconds,
+            "endurance_reference_temperature_c": thermal::ENDURANCE_REFERENCE_TEMPERATURE_C,
+            "endurance_reference_duration_seconds": thermal::ENDURANCE_REFERENCE_DURATION_SECONDS,
+            "endurance_activation_energy_ev": thermal::ENDURANCE_ACTIVATION_ENERGY_EV,
+            "retention_activation_energy_ev": thermal::RETENTION_ACTIVATION_ENERGY_EV,
         }),
     )?;
     if !lease.partially_inspected_pids.is_empty() {
@@ -223,7 +223,7 @@ fn temperature_source(args: &DeviceArgs) -> Result<TemperatureSource> {
     TemperatureSource::new(
         &args.temperature_url,
         args.temperature_pointer.clone(),
-        Duration::from_secs(args.temperature_interval_secs),
+        Duration::from_secs(args.temperature_sample_interval_seconds),
     )
 }
 
@@ -235,8 +235,8 @@ fn run(args: RunArgs) -> Result<()> {
     let device = Device::discover(&args.device.sn)?;
     let budget = Budget::new(
         args.device.pe,
-        args.physical_capacity,
-        device.size_bytes,
+        args.nand_capacity,
+        device.host_visible_capacity_bytes,
         device.logical_block_bytes,
     )?;
     let ownership = device.acquire()?;
@@ -245,12 +245,12 @@ fn run(args: RunArgs) -> Result<()> {
         log.event(
             "wear_parameters",
             json!({
-                "physical_bytes": args.physical_capacity,
+                "nand_capacity_bytes": args.nand_capacity,
                 "budget": budget,
                 "retention": parameters,
                 "coordinator": args.coordinator,
                 "run_id": args.run_id,
-                "requested_task_timeout_ms": args.task_timeout_ms,
+                "requested_coordinator_task_timeout_ms": args.coordinator_task_timeout_ms,
             }),
         )?;
         let fio = Fio::new(args.device.fio.clone(), log.dir.clone(), &device, &stop)?;
@@ -259,7 +259,7 @@ fn run(args: RunArgs) -> Result<()> {
             &args.coordinator,
             args.run_id,
             &format!("mini-qual/{}", device.serial),
-            args.task_timeout_ms,
+            args.coordinator_task_timeout_ms,
             Arc::clone(&stop),
         )
         .context("registering the poweroff worker")?;
@@ -284,7 +284,7 @@ fn run(args: RunArgs) -> Result<()> {
             &fio,
             &stop,
             budget,
-            args.device.temperature_interval_secs,
+            args.device.temperature_sample_interval_seconds,
         );
         let sampler_result = monitor.finish();
         let window = result?;
@@ -296,9 +296,9 @@ fn run(args: RunArgs) -> Result<()> {
         println!(
             "建议断电 retention {:.6} 小时（{:.3}°C）；实测等效磨损 {:.6} 小时（{:.1}°C）。",
             estimate.recommended_hours,
-            parameters.retention_temp_c,
+            parameters.retention_test_temperature_c,
             estimate.wear_equivalent_hours_at_reference,
-            thermal::WEAR_TARGET_C
+            thermal::ENDURANCE_REFERENCE_TEMPERATURE_C
         );
         std::io::Write::flush(&mut std::io::stdout())?;
         worker.check_active()?;
@@ -344,7 +344,7 @@ fn formal_io(
     fio: &Fio<'_>,
     stop: &AtomicBool,
     budget: Budget,
-    temperature_interval_secs: u64,
+    temperature_sample_interval_seconds: u64,
 ) -> Result<WearWindow> {
     let mut trial = Trial {
         log,
@@ -356,12 +356,12 @@ fn formal_io(
     let wear_started = trial.log.started.elapsed().as_secs_f64();
     trial.log.event("wear_started", json!({"budget": budget}))?;
     let mut last_end = None;
-    let rounds = budget.full_rounds + u128::from(budget.tail_blocks > 0);
+    let rounds = budget.full_rounds + u128::from(budget.final_partial_round_blocks > 0);
     for round in 1..=rounds {
         let bytes = if round <= budget.full_rounds {
-            device.size_bytes
+            device.host_visible_capacity_bytes
         } else {
-            budget.tail_blocks * device.logical_block_bytes
+            budget.final_partial_round_blocks * device.logical_block_bytes
         };
         let (_, ended) = trial.wear_round(round, bytes, last_end)?;
         last_end = Some(ended);
@@ -373,7 +373,7 @@ fn formal_io(
     let window = WearWindow {
         start_seconds: wear_started,
         end_seconds: wear_ended,
-        sample_interval_seconds: temperature_interval_secs as f64,
+        temperature_sample_interval_seconds: temperature_sample_interval_seconds as f64,
     };
 
     trial
@@ -381,10 +381,10 @@ fn formal_io(
         .event("wear_finished", serde_json::to_value(window)?)?;
     let preparation = (|| {
         trial.trim("retention", rounds + 1)?;
-        trial.write("retention", rounds + 1, device.size_bytes)?;
+        trial.write("retention", rounds + 1, device.host_visible_capacity_bytes)?;
         trial.flush("retention", rounds + 1)?;
         ensure!(
-            trial.written_blocks == budget.total_blocks,
+            trial.written_blocks == budget.total_host_write_budget_blocks,
             "host write budget mismatch"
         );
         Ok::<_, anyhow::Error>(())
@@ -395,7 +395,7 @@ fn formal_io(
     trial.log.event(
         "retention_prepared",
         json!({
-            "host_bytes": device.size_bytes,
+            "host_visible_capacity_bytes": device.host_visible_capacity_bytes,
             "cumulative_written_blocks": trial.written_blocks,
         }),
     )?;
@@ -407,16 +407,19 @@ fn pretest(args: PretestArgs) -> Result<()> {
     let source = temperature_source(&args.device)?;
     let device = Device::discover(&args.device.sn)?;
     let range = CapacityRange {
-        reference_bytes: args.reference_capacity,
-        step_bytes: args.capacity_step,
-        min_bytes: args.min_capacity,
-        max_bytes: args.max_capacity,
+        pretest_nand_capacity_bytes: args.pretest_nand_capacity,
+        nand_capacity_step_bytes: args.nand_capacity_step,
+        minimum_nand_capacity_bytes: args.minimum_nand_capacity,
+        maximum_nand_capacity_bytes: args.maximum_nand_capacity,
     };
     ensure!(
-        args.reference_capacity > device.size_bytes,
-        "pretest P_ref must be larger than U"
+        args.pretest_nand_capacity > device.host_visible_capacity_bytes,
+        "pretest NAND capacity must be larger than the host-visible capacity"
     );
-    range.validate(device.size_bytes, device.logical_block_bytes)?;
+    range.validate(
+        device.host_visible_capacity_bytes,
+        device.logical_block_bytes,
+    )?;
     let ownership = device.acquire()?;
     let mut log = open_log(&args.device, &device, &ownership, "pretest")?;
     let result = (|| {
@@ -439,7 +442,7 @@ fn pretest(args: PretestArgs) -> Result<()> {
             if stop.load(Ordering::Acquire) {
                 break Ok(());
             }
-            match trial.wear_round(round, device.size_bytes, last_end) {
+            match trial.wear_round(round, device.host_visible_capacity_bytes, last_end) {
                 Ok((timing, ended)) => {
                     timings.push(timing);
                     last_end = Some(ended);
@@ -475,7 +478,8 @@ fn pretest(args: PretestArgs) -> Result<()> {
         let window = WearWindow {
             start_seconds: first_started_elapsed,
             end_seconds: last_completed_elapsed,
-            sample_interval_seconds: args.device.temperature_interval_secs as f64,
+            temperature_sample_interval_seconds: args.device.temperature_sample_interval_seconds
+                as f64,
         };
         let measured = temperature_monitor::read_samples(&trial.log.dir)
             .and_then(|samples| thermal::equivalent_wear_seconds(window, &samples));
@@ -488,13 +492,13 @@ fn pretest(args: PretestArgs) -> Result<()> {
         };
         let recommendation = range.recommend(
             args.device.pe,
-            device.size_bytes,
+            device.host_visible_capacity_bytes,
             device.logical_block_bytes,
             model,
-            thermal::WEAR_TARGET_SECONDS,
+            thermal::ENDURANCE_REFERENCE_DURATION_SECONDS,
         )?;
         let report = json!({
-            "host_bytes": device.size_bytes,
+            "host_visible_capacity_bytes": device.host_visible_capacity_bytes,
             "pe": args.device.pe,
             "range": range,
             "model": model,
@@ -504,18 +508,20 @@ fn pretest(args: PretestArgs) -> Result<()> {
             "completed_rounds_temperature_window": window,
             "measured_equivalent_to_elapsed_ratio": equivalent_rate,
             "temperature_calculation_error": temperature_error,
-            "selection_basis_temperature_c": thermal::WEAR_TARGET_C,
+            "endurance_reference_temperature_c": thermal::ENDURANCE_REFERENCE_TEMPERATURE_C,
         });
         trial.log.report("capacity-recommendation.json", &report)?;
         trial.log.event("capacity_recommendation", report)?;
         println!(
-            "推荐配置 NAND 物理容量 P = {} Byte（k = {}），当前 U = {} Byte。",
-            recommendation.physical_bytes, recommendation.capacity_steps, device.size_bytes
+            "推荐 NAND 物理容量 {} Byte，档位偏移 {:+}，当前主机可见容量 {} Byte。",
+            recommendation.nand_capacity_bytes,
+            recommendation.nand_capacity_step_offset,
+            device.host_visible_capacity_bytes
         );
         println!(
             "预计磨损 {:.6} 小时，企业级基准 {:.0} 小时，差值 {:+.6} 小时。",
             recommendation.predicted_wear_seconds / 3600.0,
-            thermal::WEAR_TARGET_SECONDS / 3600.0,
+            thermal::ENDURANCE_REFERENCE_DURATION_SECONDS / 3600.0,
             recommendation.predicted_difference_seconds / 3600.0
         );
         Ok(())

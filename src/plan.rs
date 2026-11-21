@@ -1,43 +1,52 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-pub const MAX_CAPACITY: u64 = 2 << 50;
+pub const MAXIMUM_SUPPORTED_CAPACITY_BYTES: u64 = 2 << 50;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Budget {
-    pub physical_blocks: u64,
-    pub host_blocks: u64,
-    pub total_blocks: u128,
-    pub wear_blocks: u128,
+    pub nand_capacity_blocks: u64,
+    pub host_visible_capacity_blocks: u64,
+    pub total_host_write_budget_blocks: u128,
+    pub endurance_write_budget_blocks: u128,
     pub full_rounds: u128,
-    pub tail_blocks: u64,
+    pub final_partial_round_blocks: u64,
 }
 
 impl Budget {
-    pub fn new(pe: u64, physical_bytes: u64, host_bytes: u64, block_bytes: u64) -> Result<Self> {
+    pub fn new(
+        pe: u64,
+        nand_capacity_bytes: u64,
+        host_visible_capacity_bytes: u64,
+        logical_block_bytes: u64,
+    ) -> Result<Self> {
         ensure!(pe > 0, "PE must be positive");
         ensure!(
-            physical_bytes > host_bytes && physical_bytes <= MAX_CAPACITY,
-            "physical capacity P must be larger than host capacity U and at most 2 PiB"
+            nand_capacity_bytes > host_visible_capacity_bytes
+                && nand_capacity_bytes <= MAXIMUM_SUPPORTED_CAPACITY_BYTES,
+            "NAND capacity must be larger than the host-visible capacity and at most 2 PiB"
         );
         ensure!(
-            block_bytes > 0
-                && host_bytes > 0
-                && physical_bytes % block_bytes == 0
-                && host_bytes % block_bytes == 0,
-            "physical and host capacities must be aligned to {block_bytes} bytes"
+            logical_block_bytes > 0
+                && host_visible_capacity_bytes > 0
+                && nand_capacity_bytes % logical_block_bytes == 0
+                && host_visible_capacity_bytes % logical_block_bytes == 0,
+            "NAND and host-visible capacities must be aligned to {logical_block_bytes} bytes"
         );
-        let physical_blocks = physical_bytes / block_bytes;
-        let host_blocks = host_bytes / block_bytes;
-        let total_blocks = u128::from(pe) * u128::from(physical_blocks);
-        let wear_blocks = total_blocks - u128::from(host_blocks);
+        let nand_capacity_blocks = nand_capacity_bytes / logical_block_bytes;
+        let host_visible_capacity_blocks = host_visible_capacity_bytes / logical_block_bytes;
+        let total_host_write_budget_blocks = u128::from(pe) * u128::from(nand_capacity_blocks);
+        let endurance_write_budget_blocks =
+            total_host_write_budget_blocks - u128::from(host_visible_capacity_blocks);
         Ok(Self {
-            physical_blocks,
-            host_blocks,
-            total_blocks,
-            wear_blocks,
-            full_rounds: wear_blocks / u128::from(host_blocks),
-            tail_blocks: (wear_blocks % u128::from(host_blocks)) as u64,
+            nand_capacity_blocks,
+            host_visible_capacity_blocks,
+            total_host_write_budget_blocks,
+            endurance_write_budget_blocks,
+            full_rounds: endurance_write_budget_blocks / u128::from(host_visible_capacity_blocks),
+            final_partial_round_blocks: (endurance_write_budget_blocks
+                % u128::from(host_visible_capacity_blocks))
+                as u64,
         })
     }
 }
@@ -69,7 +78,10 @@ pub fn parse_capacity(value: &str) -> Result<u64> {
         _ => bail!("unsupported capacity unit {unit:?}"),
     };
     let bytes = decimal_units(&value[..unit_start], multiplier)?;
-    ensure!(bytes <= MAX_CAPACITY, "capacity exceeds 2 PiB");
+    ensure!(
+        bytes <= MAXIMUM_SUPPORTED_CAPACITY_BYTES,
+        "capacity exceeds 2 PiB"
+    );
     Ok(bytes)
 }
 
@@ -165,26 +177,29 @@ impl TimingModel {
         let scalable =
             self.average.write_seconds + self.average.read_seconds + self.average.locate_seconds;
         let mut seconds = (fixed + scalable) * budget.full_rounds as f64;
-        if budget.tail_blocks > 0 {
-            seconds += fixed + scalable * (budget.tail_blocks as f64 / budget.host_blocks as f64);
+        if budget.final_partial_round_blocks > 0 {
+            seconds += fixed
+                + scalable
+                    * (budget.final_partial_round_blocks as f64
+                        / budget.host_visible_capacity_blocks as f64);
         }
-        let rounds = budget.full_rounds + u128::from(budget.tail_blocks > 0);
+        let rounds = budget.full_rounds + u128::from(budget.final_partial_round_blocks > 0);
         seconds + self.average.round_gap_seconds.unwrap_or(0.0) * rounds.saturating_sub(1) as f64
     }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct CapacityRange {
-    pub reference_bytes: u64,
-    pub step_bytes: u64,
-    pub min_bytes: u64,
-    pub max_bytes: u64,
+    pub pretest_nand_capacity_bytes: u64,
+    pub nand_capacity_step_bytes: u64,
+    pub minimum_nand_capacity_bytes: u64,
+    pub maximum_nand_capacity_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Recommendation {
-    pub physical_bytes: u64,
-    pub capacity_steps: i128,
+    pub nand_capacity_bytes: u64,
+    pub nand_capacity_step_offset: i128,
     pub budget: Budget,
     pub predicted_wear_seconds: f64,
     pub baseline_wear_seconds: f64,
@@ -192,57 +207,79 @@ pub struct Recommendation {
 }
 
 impl CapacityRange {
-    fn aligned_candidates(self, host_bytes: u64, block_bytes: u64) -> Result<(u64, u64, u64)> {
-        ensure!(block_bytes > 0, "logical block size must be positive");
+    fn aligned_candidates(
+        self,
+        host_visible_capacity_bytes: u64,
+        logical_block_bytes: u64,
+    ) -> Result<(u64, u64, u64)> {
         ensure!(
-            self.step_bytes > 0
-                && self.reference_bytes > 0
-                && self.reference_bytes <= MAX_CAPACITY
-                && self.min_bytes <= self.max_bytes
-                && self.max_bytes <= MAX_CAPACITY,
-            "invalid physical capacity reference, step, or range"
+            logical_block_bytes > 0,
+            "logical block size must be positive"
+        );
+        ensure!(
+            self.nand_capacity_step_bytes > 0
+                && self.pretest_nand_capacity_bytes > 0
+                && self.pretest_nand_capacity_bytes <= MAXIMUM_SUPPORTED_CAPACITY_BYTES
+                && self.minimum_nand_capacity_bytes <= self.maximum_nand_capacity_bytes
+                && self.maximum_nand_capacity_bytes <= MAXIMUM_SUPPORTED_CAPACITY_BYTES,
+            "invalid pretest NAND capacity, NAND capacity step, or candidate range"
         );
 
-        let lower = self.min_bytes.max(host_bytes.saturating_add(1));
-        let upper = self.max_bytes;
-        let remainder = self.reference_bytes % self.step_bytes;
-        let (gcd, inverse) = gcd_coefficient(self.step_bytes.into(), block_bytes.into());
+        let lower = self
+            .minimum_nand_capacity_bytes
+            .max(host_visible_capacity_bytes.saturating_add(1));
+        let upper = self.maximum_nand_capacity_bytes;
+        let remainder = self.pretest_nand_capacity_bytes % self.nand_capacity_step_bytes;
+        let (gcd, inverse) = gcd_coefficient(
+            self.nand_capacity_step_bytes.into(),
+            logical_block_bytes.into(),
+        );
         ensure!(
             i128::from(remainder) % gcd == 0,
             "no capacity on the requested step grid aligns to logical blocks"
         );
-        // For P = remainder + n*S, solve S*n = -remainder (mod block_bytes).
-        let modulus = i128::from(block_bytes) / gcd;
-        let n = ((-i128::from(remainder) / gcd) * inverse).rem_euclid(modulus);
-        let first_aligned = u128::from(remainder) + n as u128 * u128::from(self.step_bytes);
-        let stride = modulus as u128 * u128::from(self.step_bytes);
+        // The starting remainder plus this many NAND capacity steps must be a
+        // multiple of the logical block size.
+        let modulus = i128::from(logical_block_bytes) / gcd;
+        let steps_to_first_alignment =
+            ((-i128::from(remainder) / gcd) * inverse).rem_euclid(modulus);
+        let first_aligned = u128::from(remainder)
+            + steps_to_first_alignment as u128 * u128::from(self.nand_capacity_step_bytes);
+        let aligned_candidate_spacing_bytes =
+            modulus as u128 * u128::from(self.nand_capacity_step_bytes);
         let first = first_aligned
             + u128::from(lower)
                 .saturating_sub(first_aligned)
-                .div_ceil(stride)
-                * stride;
+                .div_ceil(aligned_candidate_spacing_bytes)
+                * aligned_candidate_spacing_bytes;
         ensure!(
             first <= u128::from(upper),
-            "no legal P in the requested capacity range"
+            "no legal NAND capacity in the requested range"
         );
-        let last_index = (u128::from(upper) - first) / stride;
-        // A stride wider than the range means there is exactly one candidate.
+        let last_index = (u128::from(upper) - first) / aligned_candidate_spacing_bytes;
+        // A spacing wider than the range means there is exactly one candidate.
         Ok((
             first as u64,
-            stride.min(u128::from(MAX_CAPACITY)) as u64,
+            aligned_candidate_spacing_bytes.min(u128::from(MAXIMUM_SUPPORTED_CAPACITY_BYTES))
+                as u64,
             last_index as u64,
         ))
     }
 
-    pub fn validate(self, host_bytes: u64, block_bytes: u64) -> Result<()> {
-        self.aligned_candidates(host_bytes, block_bytes).map(|_| ())
+    pub fn validate(
+        self,
+        host_visible_capacity_bytes: u64,
+        logical_block_bytes: u64,
+    ) -> Result<()> {
+        self.aligned_candidates(host_visible_capacity_bytes, logical_block_bytes)
+            .map(|_| ())
     }
 
     pub fn recommend(
         self,
         pe: u64,
-        host_bytes: u64,
-        block_bytes: u64,
+        host_visible_capacity_bytes: u64,
+        logical_block_bytes: u64,
         model: TimingModel,
         target_seconds: f64,
     ) -> Result<Recommendation> {
@@ -250,15 +287,22 @@ impl CapacityRange {
             target_seconds.is_finite() && target_seconds > 0.0,
             "invalid wear target"
         );
-        let (first, stride, last_index) = self.aligned_candidates(host_bytes, block_bytes)?;
+        let (first, aligned_candidate_spacing_bytes, last_index) =
+            self.aligned_candidates(host_visible_capacity_bytes, logical_block_bytes)?;
         let candidate = |index| -> Result<Recommendation> {
-            let physical_bytes = first + index * stride;
-            let budget = Budget::new(pe, physical_bytes, host_bytes, block_bytes)?;
+            let nand_capacity_bytes = first + index * aligned_candidate_spacing_bytes;
+            let budget = Budget::new(
+                pe,
+                nand_capacity_bytes,
+                host_visible_capacity_bytes,
+                logical_block_bytes,
+            )?;
             let predicted_wear_seconds = model.predict_wear_seconds(budget);
             Ok(Recommendation {
-                physical_bytes,
-                capacity_steps: (i128::from(physical_bytes) - i128::from(self.reference_bytes))
-                    / i128::from(self.step_bytes),
+                nand_capacity_bytes,
+                nand_capacity_step_offset: (i128::from(nand_capacity_bytes)
+                    - i128::from(self.pretest_nand_capacity_bytes))
+                    / i128::from(self.nand_capacity_step_bytes),
                 budget,
                 predicted_wear_seconds,
                 baseline_wear_seconds: target_seconds,

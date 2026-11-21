@@ -33,7 +33,7 @@ struct Measurement {
     elapsed_seconds: f64,
     http_status: Option<u16>,
     raw_json_body: Option<String>,
-    temperature_c: Option<f64>,
+    measured_case_temperature_c: Option<f64>,
     error: Option<String>,
 }
 
@@ -114,7 +114,7 @@ impl TemperatureSource {
                         elapsed_seconds,
                         http_status,
                         raw_json_body,
-                        temperature_c: parsed.as_ref().ok().copied(),
+                        measured_case_temperature_c: parsed.as_ref().ok().copied(),
                         error: parsed.err(),
                     };
                     run_log::write_json_line(&mut file, &measurement)?;
@@ -264,10 +264,10 @@ pub fn read_samples(log_dir: &Path) -> Result<Vec<Sample>> {
     for line in BufReader::new(file).lines() {
         let entry: Measurement =
             serde_json::from_str(&line?).context("reading temperature timeline")?;
-        if let Some(temperature_c) = entry.temperature_c {
+        if let Some(measured_case_temperature_c) = entry.measured_case_temperature_c {
             samples.push(Sample {
                 elapsed_seconds: entry.elapsed_seconds,
-                temperature_c,
+                measured_case_temperature_c,
             });
         }
     }

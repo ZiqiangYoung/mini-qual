@@ -14,6 +14,12 @@ fn extracts_case_temperature_and_asks_for_a_pointer_for_ambiguous_responses() {
     assert_eq!(source.parse_temperature("76.5").unwrap(), 76.5);
     assert_eq!(
         source
+            .parse_temperature(r#"{"temperature_c":76.5}"#)
+            .unwrap(),
+        76.5
+    );
+    assert_eq!(
+        source
             .parse_temperature(r#"{"data":{"case_temperature_c":76.75,"temperature":60}}"#)
             .unwrap(),
         76.75
@@ -72,7 +78,8 @@ fn records_raw_temperature_from_http_get_and_closes_the_sampler() {
     let record: serde_json::Value = serde_json::from_str(&content).unwrap();
     assert_eq!(record["raw_json_body"], response);
     assert_eq!(record["http_status"], 200);
+    assert_eq!(record["measured_case_temperature_c"], 76.75);
     assert!(record["query_time"].as_str().unwrap().ends_with('Z'));
     assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0].temperature_c, 76.75);
+    assert_eq!(samples[0].measured_case_temperature_c, 76.75);
 }

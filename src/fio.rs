@@ -155,21 +155,24 @@ impl<'a> Fio<'a> {
             String::from_utf8_lossy(&engine.stderr).trim()
         );
         ensure!(
-            device.discard_max_bytes >= device.logical_block_bytes,
+            device.maximum_discard_request_bytes >= device.logical_block_bytes,
             "the namespace does not advertise usable discard support"
         );
         Ok(fio)
     }
 
     pub fn trim(&self, phase: &str, round: u128) -> Result<Stage> {
-        let block_bytes = self.device.discard_max_bytes.min(MAX_TRIM_BYTES)
+        let block_bytes = self
+            .device
+            .maximum_discard_request_bytes
+            .min(MAX_TRIM_BYTES)
             / self.device.logical_block_bytes
             * self.device.logical_block_bytes;
         self.run_sequential(
             phase,
             round,
             Operation::Trim,
-            self.device.size_bytes,
+            self.device.host_visible_capacity_bytes,
             block_bytes,
         )
     }
@@ -275,7 +278,7 @@ impl<'a> Fio<'a> {
     ) -> Result<Stage> {
         ensure!(
             bytes > 0
-                && bytes <= self.device.size_bytes
+                && bytes <= self.device.host_visible_capacity_bytes
                 && bytes % self.device.logical_block_bytes == 0,
             "{} range is outside the namespace or not LBA-aligned",
             operation.name()

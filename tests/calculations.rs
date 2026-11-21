@@ -15,13 +15,19 @@ fn exact_inputs_and_block_budget_include_retention() {
     assert!(plan::parse_capacity("2.001 PiB").is_err());
 
     let budget = Budget::new(3, 6 * 4096, 4 * 4096, 4096).unwrap();
-    assert_eq!(budget.wear_blocks, 14);
+    assert_eq!(budget.endurance_write_budget_blocks, 14);
     assert_eq!(budget.full_rounds, 3);
-    assert_eq!(budget.tail_blocks, 2);
+    assert_eq!(budget.final_partial_round_blocks, 2);
     assert_eq!(
-        budget.wear_blocks + u128::from(budget.host_blocks),
-        budget.total_blocks
+        budget.endurance_write_budget_blocks + u128::from(budget.host_visible_capacity_blocks),
+        budget.total_host_write_budget_blocks
     );
+    let serialized_budget = serde_json::to_value(budget).unwrap();
+    assert_eq!(serialized_budget["nand_capacity_blocks"], 6);
+    assert_eq!(serialized_budget["host_visible_capacity_blocks"], 4);
+    assert_eq!(serialized_budget["total_host_write_budget_blocks"], 18);
+    assert_eq!(serialized_budget["endurance_write_budget_blocks"], 14);
+    assert_eq!(serialized_budget["final_partial_round_blocks"], 2);
     assert!(Budget::new(3, 6 * 4096 + 1, 4 * 4096, 4096).is_err());
 
     let largest = Budget::new(u64::MAX, 2 << 50, 512, 512).unwrap();
@@ -48,29 +54,61 @@ fn recommendation_matches_enumeration_of_the_relative_capacity_grid() {
         timing,
     ])
     .unwrap();
-    let host = 4096;
-    let block = 512;
-    for (reference, step) in [(5120, 1024), (5121, 3), (5121, 8), (5120, 768)] {
+    let host_visible_capacity_bytes = 4096;
+    let logical_block_bytes = 512;
+    for (pretest_nand_capacity_bytes, nand_capacity_step_bytes) in
+        [(5120, 1024), (5121, 3), (5121, 8), (5120, 768)]
+    {
         let range = CapacityRange {
-            reference_bytes: reference,
-            step_bytes: step,
-            min_bytes: 3100,
-            max_bytes: 14_000,
+            pretest_nand_capacity_bytes,
+            nand_capacity_step_bytes,
+            minimum_nand_capacity_bytes: 3100,
+            maximum_nand_capacity_bytes: 14_000,
         };
         for target in [1.0_f64, 57.0, 73.0, 103.0, 130.0, 146.7, 1000.0] {
-            let expected = (range.min_bytes..=range.max_bytes)
-                .filter(|p| *p > host && p % block == 0)
-                .filter(|p| p.abs_diff(reference) % step == 0)
-                .map(|p| {
-                    let budget = Budget::new(1, p, host, block).unwrap();
-                    (p, (model.predict_wear_seconds(budget) - target).abs())
+            let expected = (range.minimum_nand_capacity_bytes..=range.maximum_nand_capacity_bytes)
+                .filter(|capacity| {
+                    *capacity > host_visible_capacity_bytes && capacity % logical_block_bytes == 0
                 })
-                .min_by(|a, b| a.1.total_cmp(&b.1));
-            let actual = range.recommend(1, host, block, model, target);
+                .filter(|capacity| {
+                    capacity.abs_diff(pretest_nand_capacity_bytes) % nand_capacity_step_bytes == 0
+                })
+                .map(|capacity| {
+                    let budget = Budget::new(
+                        1,
+                        capacity,
+                        host_visible_capacity_bytes,
+                        logical_block_bytes,
+                    )
+                    .unwrap();
+                    (
+                        capacity,
+                        (model.predict_wear_seconds(budget) - target).abs(),
+                    )
+                })
+                .min_by(|left, right| left.1.total_cmp(&right.1));
+            let recommendation = range.recommend(
+                1,
+                host_visible_capacity_bytes,
+                logical_block_bytes,
+                model,
+                target,
+            );
             assert_eq!(
-                actual.ok().map(|actual| actual.physical_bytes),
+                recommendation
+                    .as_ref()
+                    .ok()
+                    .map(|result| result.nand_capacity_bytes),
                 expected.map(|result| result.0)
             );
+            if let Ok(recommendation) = recommendation {
+                assert_eq!(
+                    i128::from(recommendation.nand_capacity_bytes),
+                    i128::from(pretest_nand_capacity_bytes)
+                        + recommendation.nand_capacity_step_offset
+                            * i128::from(nand_capacity_step_bytes)
+                );
+            }
         }
     }
 }
@@ -78,29 +116,36 @@ fn recommendation_matches_enumeration_of_the_relative_capacity_grid() {
 #[test]
 fn thermal_correction_matches_reference_and_preserves_the_half_factor_floor() {
     let parameters = RetentionParameters {
-        baseline_temp_c: 40.0,
-        baseline_hours: 101.0,
-        retention_temp_c: 40.0,
+        retention_baseline_temperature_c: 40.0,
+        retention_baseline_duration_hours: 101.0,
+        retention_test_temperature_c: 40.0,
     };
     let window = WearWindow {
         start_seconds: 1.0,
-        end_seconds: 1.0 + thermal::WEAR_TARGET_SECONDS,
-        sample_interval_seconds: thermal::WEAR_TARGET_SECONDS,
+        end_seconds: 1.0 + thermal::ENDURANCE_REFERENCE_DURATION_SECONDS,
+        temperature_sample_interval_seconds: thermal::ENDURANCE_REFERENCE_DURATION_SECONDS,
     };
     let samples = [
         Sample {
             elapsed_seconds: window.start_seconds,
-            temperature_c: thermal::WEAR_TARGET_C,
+            measured_case_temperature_c: thermal::ENDURANCE_REFERENCE_TEMPERATURE_C,
         },
         Sample {
             elapsed_seconds: window.end_seconds,
-            temperature_c: thermal::WEAR_TARGET_C,
+            measured_case_temperature_c: thermal::ENDURANCE_REFERENCE_TEMPERATURE_C,
         },
     ];
     let estimate = parameters.estimate(window, &samples).unwrap();
-    assert_eq!(estimate.recommended_hours, parameters.baseline_hours);
+    assert_eq!(
+        estimate.recommended_hours,
+        parameters.retention_baseline_duration_hours
+    );
     assert_eq!(estimate.wear_equivalent_hours_at_reference, 1200.0);
-    assert!((estimate.wear_effective_c - thermal::WEAR_TARGET_C).abs() < 1e-10);
+    assert!(
+        (estimate.effective_endurance_temperature_c - thermal::ENDURANCE_REFERENCE_TEMPERATURE_C)
+            .abs()
+            < 1e-10
+    );
 
     let short = WearWindow {
         end_seconds: 3601.0,
@@ -110,7 +155,7 @@ fn thermal_correction_matches_reference_and_preserves_the_half_factor_floor() {
     assert_eq!(short_estimate.wear_adjustment, 0.5);
     assert_eq!(short_estimate.recommended_hours, 50.5);
     let hotter = RetentionParameters {
-        retention_temp_c: 80.0,
+        retention_test_temperature_c: 80.0,
         ..parameters
     };
     assert!(
@@ -127,20 +172,20 @@ fn thermal_timeline_integrates_arrhenius_rates_and_rejects_long_gaps() {
     let window = WearWindow {
         start_seconds: 10.0,
         end_seconds: 30.0,
-        sample_interval_seconds: 15.0,
+        temperature_sample_interval_seconds: 15.0,
     };
     let samples = [
         Sample {
             elapsed_seconds: 0.0,
-            temperature_c: 76.5,
+            measured_case_temperature_c: 76.5,
         },
         Sample {
             elapsed_seconds: 20.0,
-            temperature_c: 86.5,
+            measured_case_temperature_c: 86.5,
         },
         Sample {
             elapsed_seconds: 40.0,
-            temperature_c: 76.5,
+            measured_case_temperature_c: 76.5,
         },
     ];
     let hot_rate = (1.1 / 8.617_1e-5 * (1.0 / 349.65 - 1.0 / 359.65_f64)).exp();
@@ -150,7 +195,7 @@ fn thermal_timeline_integrates_arrhenius_rates_and_rejects_long_gaps() {
     assert!(
         thermal::equivalent_wear_seconds(
             WearWindow {
-                sample_interval_seconds: 5.0,
+                temperature_sample_interval_seconds: 5.0,
                 ..window
             },
             &samples,

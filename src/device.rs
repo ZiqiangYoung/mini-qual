@@ -34,8 +34,8 @@ pub struct Device {
     pub path: PathBuf,
     pub serial: String,
     pub logical_block_bytes: u64,
-    pub size_bytes: u64,
-    pub discard_max_bytes: u64,
+    pub host_visible_capacity_bytes: u64,
+    pub maximum_discard_request_bytes: u64,
     controller: PathBuf,
     namespace: PathBuf,
     disk_sequence: Option<u64>,
@@ -60,15 +60,16 @@ impl Device {
             "invalid logical block size {logical_block_bytes} for {}",
             path.display()
         );
-        let size_bytes = volume_bytes(&namespace, logical_block_bytes)?;
-        let discard_max_bytes = read_number(&namespace.join("queue/discard_max_bytes"))?;
+        let host_visible_capacity_bytes = volume_bytes(&namespace, logical_block_bytes)?;
+        let maximum_discard_request_bytes =
+            read_number(&namespace.join("queue/discard_max_bytes"))?;
         let disk_sequence = optional_number(&namespace.join("diskseq"))?;
         let device = Self {
             path,
             serial: serial.to_owned(),
             logical_block_bytes,
-            size_bytes,
-            discard_max_bytes,
+            host_visible_capacity_bytes,
+            maximum_discard_request_bytes,
             controller,
             namespace,
             disk_sequence,
@@ -146,7 +147,8 @@ impl Device {
         ensure!(
             read_number(&self.namespace.join("queue/logical_block_size"))?
                 == self.logical_block_bytes
-                && volume_bytes(&self.namespace, self.logical_block_bytes)? == self.size_bytes,
+                && volume_bytes(&self.namespace, self.logical_block_bytes)?
+                    == self.host_visible_capacity_bytes,
             "namespace geometry changed for {}",
             self.path.display()
         );
@@ -201,7 +203,7 @@ impl Device {
             storage,
             buffer_offset,
             block_bytes,
-            block_count: self.size_bytes / self.logical_block_bytes,
+            block_count: self.host_visible_capacity_bytes / self.logical_block_bytes,
             // Read formatted namespaces with metadata through the kernel's block driver.
             use_passthrough: metadata_bytes == 0,
         })
