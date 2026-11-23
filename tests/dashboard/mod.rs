@@ -6,7 +6,8 @@ use std::process::{Command, Stdio};
 use ratatui::backend::TestBackend;
 
 use super::{
-    Dashboard, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, Terminal, is_interrupt, render,
+    Dashboard, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, Terminal, format_bytes, format_rate,
+    is_interrupt, render,
 };
 use crate::telemetry::{IoProgress, Mode, Phase, Snapshot, StageKind, Telemetry, TrialInfo};
 
@@ -15,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const MIB: u64 = 1024 * 1024;
+const MB: u64 = 1_000_000;
 const TEST_SCENARIO: &str = "MINI_QUAL_DASHBOARD_TEST_SCENARIO";
 const ENTER_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h";
 const LEAVE_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049l";
@@ -28,7 +29,7 @@ fn trial_info(mode: Mode) -> TrialInfo {
         log_dir: "/tmp/test-qual-logs".into(),
         started: Instant::now(),
         total_wear_rounds: (mode == Mode::Run).then_some(5),
-        total_write_budget_bytes: (mode == Mode::Run).then_some(u128::from(3 * 1024 * MIB)),
+        total_write_budget_bytes: (mode == Mode::Run).then_some(u128::from(3 * 1_000 * MB)),
     }
 }
 
@@ -41,14 +42,24 @@ fn screen(width: u16, height: u16, snapshot: &Snapshot, stopping: bool) -> Strin
 }
 
 #[test]
+fn capacity_and_bandwidth_use_decimal_megabytes_and_gigabytes() {
+    assert_eq!(format_bytes(0), "0 MB");
+    assert_eq!(format_bytes(512), "0.000512 MB");
+    assert_eq!(format_bytes(1_000_000), "1.0 MB");
+    assert_eq!(format_bytes(1_000_000_000), "1.0 GB");
+    assert_eq!(format_rate(Some(480_000_000.0)), "480.0 MB/s");
+    assert_eq!(format_rate(Some(1_500_000_000.0)), "1.5 GB/s");
+}
+
+#[test]
 fn full_and_compact_layouts_show_work_temperature_and_bandwidth() {
     let telemetry = Telemetry::new(trial_info(Mode::Run));
-    telemetry.start_round(Phase::Wear, 2, 512 * MIB, 512 * MIB);
+    telemetry.start_round(Phase::Wear, 2, 512 * MB, 512 * MB);
     telemetry.round_completed(1);
     let completed = IoProgress {
-        attempted_bytes: 512 * MIB,
-        successful_bytes: 512 * MIB,
-        bytes_per_second: Some(128.0 * MIB as f64),
+        attempted_bytes: 512 * MB,
+        successful_bytes: 512 * MB,
+        bytes_per_second: Some(128.0 * MB as f64),
         ..IoProgress::default()
     };
     for kind in [StageKind::Trim, StageKind::Write] {
@@ -59,10 +70,10 @@ fn full_and_compact_layouts_show_work_temperature_and_bandwidth() {
     telemetry.stage_completed(StageKind::Flush, Duration::from_secs(1), None);
     telemetry.stage_started(StageKind::Read);
     telemetry.io_progress(IoProgress {
-        attempted_bytes: 256 * MIB,
-        successful_bytes: 255 * MIB,
+        attempted_bytes: 256 * MB,
+        successful_bytes: 255 * MB,
         errors: 1,
-        bytes_per_second: Some(64.0 * MIB as f64),
+        bytes_per_second: Some(64.0 * MB as f64),
     });
     telemetry.temperature("2026-11-21T00:00:00Z", 0.0, &Ok(42.5));
     telemetry.temperature("2026-11-21T00:00:05Z", 5.0, &Ok(42.75));
@@ -75,7 +86,7 @@ fn full_and_compact_layouts_show_work_temperature_and_bandwidth() {
             "/dev/test-disk",
             "第 2 轮",
             "已完成 1 / 5 轮",
-            "累计写入 512.0 MiB",
+            "累计写入 512.0 MB / 3.0 GB 总预算",
             "TRIM",
             "写入",
             "flush",
@@ -85,9 +96,9 @@ fn full_and_compact_layouts_show_work_temperature_and_bandwidth() {
             "执行中",
             "完成",
             "50.0%",
-            "256.0 MiB / 512.0 MiB",
-            "64.0 MiB/s",
-            "失败 1.0 MiB",
+            "256.0 MB / 512.0 MB",
+            "64.0 MB/s",
+            "失败 1.0 MB",
             "42.75 °C",
         ] {
             assert!(
@@ -101,17 +112,17 @@ fn full_and_compact_layouts_show_work_temperature_and_bandwidth() {
 #[test]
 fn shows_tail_round_and_retention_handoff_on_narrow_terminals() {
     let telemetry = Telemetry::new(trial_info(Mode::Run));
-    telemetry.start_round(Phase::Wear, 5, 512 * MIB, MIB);
+    telemetry.start_round(Phase::Wear, 5, 512 * MB, MB);
     telemetry.stage_started(StageKind::Write);
     telemetry.io_progress(IoProgress {
-        attempted_bytes: MIB / 2,
+        attempted_bytes: MB / 2,
         ..IoProgress::default()
     });
     let tail = screen(68, 23, &telemetry.snapshot().unwrap(), false);
-    assert!(tail.contains("512.0 KiB / 1.0 MiB"), "{tail}");
+    assert!(tail.contains("0.5 MB / 1.0 MB"), "{tail}");
 
     telemetry.round_completed(5);
-    telemetry.start_round(Phase::Retention, 6, 512 * MIB, 512 * MIB);
+    telemetry.start_round(Phase::Retention, 6, 512 * MB, 512 * MB);
     telemetry.stage_started(StageKind::Handoff);
     telemetry.message("准备上报断电协调器");
     let retention = telemetry.snapshot().unwrap();

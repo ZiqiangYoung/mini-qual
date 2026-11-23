@@ -690,18 +690,21 @@ fn format_rate(rate: Option<f64>) -> String {
         )
 }
 
-fn format_scaled_bytes(mut bytes: f64) -> String {
-    const UNITS: [&str; 9] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB"];
-    let mut unit = 0;
-    while bytes >= 1024.0 && unit < UNITS.len() - 1 {
-        bytes /= 1024.0;
-        unit += 1;
+fn format_scaled_bytes(bytes: f64) -> String {
+    const BYTES_PER_MB: f64 = 1_000_000.0;
+    const BYTES_PER_GB: f64 = 1_000_000_000.0;
+    if bytes >= BYTES_PER_GB {
+        return format!("{:.1} GB", bytes / BYTES_PER_GB);
     }
-    if unit == 0 {
-        format!("{bytes:.0} B")
-    } else {
-        format!("{bytes:.1} {}", UNITS[unit])
+    let megabytes = bytes / BYTES_PER_MB;
+    if megabytes >= 1.0 {
+        return format!("{megabytes:.1} MB");
     }
+    if bytes > 0.0 && bytes < 1.0 {
+        return "<0.000001 MB".into();
+    }
+    let value = format!("{megabytes:.6}");
+    format!("{} MB", value.trim_end_matches('0').trim_end_matches('.'))
 }
 
 fn format_duration(duration: Duration) -> String {
