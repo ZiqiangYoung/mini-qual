@@ -776,6 +776,8 @@ impl Trial<'_> {
             Err(error) => return self.stage_error(phase, round, kind, error),
         };
         let seconds = stage.duration.as_secs_f64();
+        let attempted_bytes_per_second =
+            (seconds > 0.0).then(|| stage.attempted_bytes as f64 / seconds);
         let successful_bytes_per_second =
             (seconds > 0.0).then(|| stage.successful_bytes as f64 / seconds);
         self.log.event("stage_finished", json!({
@@ -783,7 +785,7 @@ impl Trial<'_> {
             "seconds": seconds,
             "attempted_bytes": stage.attempted_bytes, "successful_bytes": stage.successful_bytes,
             "error_count": stage.errors,
-            "attempted_bytes_per_second": (seconds > 0.0).then(|| stage.attempted_bytes as f64 / seconds),
+            "attempted_bytes_per_second": attempted_bytes_per_second,
             "successful_bytes_per_second": successful_bytes_per_second,
         }))?;
         self.telemetry.stage_completed(
@@ -794,6 +796,7 @@ impl Trial<'_> {
                 successful_bytes: stage.successful_bytes,
                 errors: stage.errors,
                 bytes_per_second: successful_bytes_per_second,
+                attempted_bytes_per_second,
             }),
         );
         Ok(stage)

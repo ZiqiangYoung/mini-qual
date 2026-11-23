@@ -41,14 +41,33 @@ impl Stage {
         self.errors += next.errors;
     }
 
-    fn progress(&self, bytes_per_second: Option<f64>) -> IoProgress {
+    fn progress(&self) -> IoProgress {
         IoProgress {
             attempted_bytes: self.attempted_bytes,
             successful_bytes: self.successful_bytes,
             errors: self.errors,
-            bytes_per_second,
+            ..IoProgress::default()
         }
     }
+}
+
+fn sampled_progress(
+    mut progress: IoProgress,
+    previous: IoProgress,
+    elapsed: Duration,
+) -> IoProgress {
+    if !elapsed.is_zero() {
+        let seconds = elapsed.as_secs_f64();
+        let rate = |bytes: u64, previous_bytes| {
+            bytes
+                .checked_sub(previous_bytes)
+                .map(|delta| delta as f64 / seconds)
+        };
+        progress.bytes_per_second = rate(progress.successful_bytes, previous.successful_bytes);
+        progress.attempted_bytes_per_second =
+            rate(progress.attempted_bytes, previous.attempted_bytes);
+    }
+    progress
 }
 
 pub struct Fio<'a> {
@@ -123,7 +142,7 @@ struct StatusObserver<'a> {
     region: &'a Region,
     completed: &'a Stage,
     failures: &'a LiveFailures,
-    previous_sample: Option<(Instant, u64)>,
+    previous_sample: Option<(Instant, IoProgress)>,
 }
 
 impl StatusObserver<'_> {
@@ -143,25 +162,22 @@ impl StatusObserver<'_> {
         };
         let successful_bytes = successful_bytes.min(self.region.bytes);
         let now = Instant::now();
-        let bytes_per_second = self
-            .previous_sample
-            .and_then(|(previous_at, previous_bytes)| {
-                let elapsed = now.duration_since(previous_at).as_secs_f64();
-                let delta = successful_bytes.checked_sub(previous_bytes)?;
-                (elapsed > 0.0).then(|| delta as f64 / elapsed)
-            });
-        self.previous_sample = Some((now, successful_bytes));
         let failed_count = self.failures.count.load(Ordering::Acquire);
         let failed_bytes = self.failures.bytes.load(Ordering::Relaxed);
-        self.telemetry.io_progress(IoProgress {
+        let mut progress = IoProgress {
             attempted_bytes: self.completed.attempted_bytes
                 + successful_bytes
                     .saturating_add(failed_bytes)
                     .min(self.region.bytes),
             successful_bytes: self.completed.successful_bytes + successful_bytes,
             errors: self.completed.errors + failed_count,
-            bytes_per_second,
-        });
+            ..IoProgress::default()
+        };
+        if let Some((previous_at, previous)) = self.previous_sample {
+            progress = sampled_progress(progress, previous, now.duration_since(previous_at));
+        }
+        self.previous_sample = Some((now, progress));
+        self.telemetry.io_progress(progress);
     }
 }
 
@@ -301,7 +317,7 @@ impl<'a> Fio<'a> {
         saved?;
         self.device.check_ready()?;
         result.duration = start.elapsed();
-        self.telemetry.io_progress(result.progress(None));
+        self.telemetry.io_progress(result.progress());
         Ok(result)
     }
 
@@ -309,7 +325,7 @@ impl<'a> Fio<'a> {
         let mut result = Stage::default();
         let mut reader = None;
         let mut last_check = Instant::now();
-        let mut last_progress = (last_check, 0);
+        let mut last_progress = (last_check, result.progress());
         for name in ["read", "read-tail"] {
             let read_job = Job { name, ..job };
             let path = read_job.file(&self.output, "errors.jsonl");
@@ -362,11 +378,13 @@ impl<'a> Fio<'a> {
                         && last_progress.0.elapsed() >= LOCALIZATION_SAMPLE_INTERVAL
                     {
                         let now = Instant::now();
-                        let bytes_per_second = (result.successful_bytes - last_progress.1) as f64
-                            / now.duration_since(last_progress.0).as_secs_f64();
-                        self.telemetry
-                            .io_progress(result.progress(Some(bytes_per_second)));
-                        last_progress = (now, result.successful_bytes);
+                        let progress = sampled_progress(
+                            result.progress(),
+                            last_progress.1,
+                            now.duration_since(last_progress.0),
+                        );
+                        self.telemetry.io_progress(progress);
+                        last_progress = (now, progress);
                     }
                 }
             }
@@ -413,7 +431,7 @@ impl<'a> Fio<'a> {
                 block_bytes,
             };
             result.extend(self.run_range(job, operation, &region, &result)?);
-            self.telemetry.io_progress(result.progress(None));
+            self.telemetry.io_progress(result.progress());
         }
         // Separate the tail because fio can round a fixed-block job's size down.
         if remainder > 0 {
@@ -429,7 +447,7 @@ impl<'a> Fio<'a> {
                 block_bytes: remainder,
             };
             result.extend(self.run_range(job, operation, &region, &result)?);
-            self.telemetry.io_progress(result.progress(None));
+            self.telemetry.io_progress(result.progress());
         }
         result.duration = start.elapsed();
         Ok(result)

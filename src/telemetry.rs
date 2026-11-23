@@ -78,6 +78,7 @@ pub struct IoProgress {
     pub successful_bytes: u64,
     pub errors: u64,
     pub bytes_per_second: Option<f64>,
+    pub attempted_bytes_per_second: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +89,7 @@ pub struct Task {
     pub started: Option<Instant>,
     pub duration: Option<Duration>,
     pub progress: Option<IoProgress>,
+    pub progress_at: Option<Instant>,
 }
 
 impl Task {
@@ -99,6 +101,7 @@ impl Task {
             started: None,
             duration: None,
             progress: None,
+            progress_at: None,
         }
     }
 }
@@ -246,6 +249,7 @@ impl Telemetry {
                 .find(|task| task.status == StageStatus::Running)
             {
                 task.progress = Some(progress);
+                task.progress_at = Some(Instant::now());
             }
         });
     }

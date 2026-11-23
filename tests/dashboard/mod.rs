@@ -71,9 +71,10 @@ fn full_and_compact_layouts_show_work_temperature_and_bandwidth() {
     telemetry.stage_started(StageKind::Read);
     telemetry.io_progress(IoProgress {
         attempted_bytes: 256 * MB,
-        successful_bytes: 255 * MB,
+        successful_bytes: 224 * MB,
         errors: 1,
-        bytes_per_second: Some(64.0 * MB as f64),
+        bytes_per_second: Some(32.0 * MB as f64),
+        attempted_bytes_per_second: Some(64.0 * MB as f64),
     });
     telemetry.temperature("2026-11-21T00:00:00Z", 0.0, &Ok(42.5));
     telemetry.temperature("2026-11-21T00:00:05Z", 5.0, &Ok(42.75));
@@ -97,8 +98,9 @@ fn full_and_compact_layouts_show_work_temperature_and_bandwidth() {
             "完成",
             "50.0%",
             "256.0 MB / 512.0 MB",
-            "64.0 MB/s",
-            "失败 1.0 MB",
+            "32.0 MB/s",
+            "预计剩余 00:00:04",
+            "失败 32.0 MB",
             "42.75 °C",
         ] {
             assert!(
@@ -116,10 +118,12 @@ fn shows_tail_round_and_retention_handoff_on_narrow_terminals() {
     telemetry.stage_started(StageKind::Write);
     telemetry.io_progress(IoProgress {
         attempted_bytes: MB / 2,
+        attempted_bytes_per_second: Some(300_000.0),
         ..IoProgress::default()
     });
     let tail = screen(68, 23, &telemetry.snapshot().unwrap(), false);
     assert!(tail.contains("0.5 MB / 1.0 MB"), "{tail}");
+    assert!(tail.contains("预计剩余 00:00:02"), "{tail}");
 
     telemetry.round_completed(5);
     telemetry.start_round(Phase::Retention, 6, 512 * MB, 512 * MB);
@@ -131,10 +135,36 @@ fn shows_tail_round_and_retention_handoff_on_narrow_terminals() {
     assert!(contents.contains("断电交接 · 执行中"), "{contents}");
     assert!(contents.contains("正在停止"), "{contents}");
     assert!(!contents.contains("错误定位"), "{contents}");
+    assert!(!contents.contains("预计剩余"), "{contents}");
 
     let tiny = screen(33, 8, &retention, true);
     assert!(tiny.contains("断电交接 · 执行中"), "{tiny}");
     assert!(tiny.contains("正在停止"), "{tiny}");
+}
+
+#[test]
+fn running_task_eta_requires_a_fresh_positive_processing_rate() {
+    let telemetry = Telemetry::new(trial_info(Mode::Pretest));
+    telemetry.start_round(Phase::Wear, 1, 2 * MB, 2 * MB);
+    telemetry.stage_started(StageKind::Trim);
+    let contents = screen(80, 12, &telemetry.snapshot().unwrap(), false);
+    assert!(contents.contains("预计剩余 —"), "{contents}");
+
+    for rate in [Some(0.0), Some(f64::NAN), Some(100_000.0)] {
+        telemetry.io_progress(IoProgress {
+            attempted_bytes: MB,
+            attempted_bytes_per_second: rate,
+            ..IoProgress::default()
+        });
+        let mut snapshot = telemetry.snapshot().unwrap();
+        if rate == Some(100_000.0) {
+            let contents = screen(80, 12, &snapshot, false);
+            assert!(contents.contains("预计剩余 00:00:10"), "{contents}");
+            snapshot.tasks[0].progress_at = Some(Instant::now() - Duration::from_secs(4));
+        }
+        let contents = screen(80, 12, &snapshot, false);
+        assert!(contents.contains("预计剩余 —"), "{contents}");
+    }
 }
 
 #[test]

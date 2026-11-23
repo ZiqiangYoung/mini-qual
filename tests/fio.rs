@@ -73,12 +73,13 @@ mod device {
 mod telemetry {
     use std::sync::{Arc, Mutex};
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, Default)]
     pub struct IoProgress {
         pub attempted_bytes: u64,
         pub successful_bytes: u64,
         pub errors: u64,
         pub bytes_per_second: Option<f64>,
+        pub attempted_bytes_per_second: Option<f64>,
     }
 
     #[derive(Default, Clone)]
@@ -228,6 +229,9 @@ fn live_status_keeps_only_final_reports_and_merges_read_tail_progress() -> Resul
             && sample.successful_bytes == 4096
             && sample.errors == 2
             && sample.bytes_per_second.is_some_and(|rate| rate > 0.0)
+            && sample
+                .attempted_bytes_per_second
+                .is_some_and(|rate| rate > 0.0)
     }));
     Ok(())
 }

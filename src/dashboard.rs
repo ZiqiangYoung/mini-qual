@@ -19,6 +19,7 @@ use crate::telemetry::{Mode, Phase, Snapshot, StageKind, StageStatus, Task, Tele
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(250);
 const INPUT_INTERVAL: Duration = Duration::from_millis(50);
+const ETA_SAMPLE_MAX_AGE: Duration = Duration::from_secs(3);
 const ACCENT: Color = Color::LightCyan;
 
 pub struct Dashboard {
@@ -200,7 +201,7 @@ fn render_compact(frame: &mut Frame<'_>, area: Rect, view: &Snapshot, stopping: 
     .areas(area);
     let [tasks, progress, temperature, events] = Layout::vertical([
         Constraint::Length(tasks_height),
-        Constraint::Length(if enough_for_details { 4 } else { 2 }),
+        Constraint::Length(if enough_for_details { 5 } else { 3 }),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
@@ -342,16 +343,19 @@ fn compact_progress(view: &Snapshot) -> Vec<Line<'static>> {
         .duration
         .or_else(|| task.started.map(|start| start.elapsed()));
     let title = format!("{} · {}", task_name(task.kind), status_label(task.status));
+    let eta = remaining_time_line(task);
     let Some(progress) = task.progress else {
         let detail = match (task.status, task.target_bytes, elapsed) {
             (StageStatus::Running, Some(_), _) => " · 等待采样".to_owned(),
             (_, _, Some(duration)) => format!(" · {}", format_duration(duration)),
             _ => String::new(),
         };
-        return vec![Line::styled(
+        let mut lines = vec![Line::styled(
             format!("{title}{detail}"),
             status_style(task.status),
         )];
+        lines.extend(eta);
+        return lines;
     };
 
     let bytes = format_bytes(progress.attempted_bytes.into());
@@ -378,10 +382,12 @@ fn compact_progress(view: &Snapshot) -> Vec<Line<'static>> {
     let duration = elapsed.map_or_else(String::new, |duration| {
         format!(" · {}", format_duration(duration))
     });
-    let mut lines = vec![
-        Line::styled(format!("{title}  {work}"), status_style(task.status)),
-        Line::from(format!("{bandwidth}{duration}")),
-    ];
+    let mut lines = vec![Line::styled(
+        format!("{title}  {work}"),
+        status_style(task.status),
+    )];
+    lines.extend(eta);
+    lines.push(Line::from(format!("{bandwidth}{duration}")));
     if matches!(task.kind, StageKind::Read | StageKind::Locate) {
         let failed_bytes = progress
             .attempted_bytes
@@ -394,6 +400,25 @@ fn compact_progress(view: &Snapshot) -> Vec<Line<'static>> {
         )));
     }
     lines
+}
+
+fn remaining_time_line(task: &Task) -> Option<Line<'static>> {
+    if task.status != StageStatus::Running {
+        return None;
+    }
+    let target = task.target_bytes.filter(|target| *target > 0)?;
+    let estimate = task.progress.and_then(|progress| {
+        let remaining = target.checked_sub(progress.attempted_bytes)?;
+        if remaining == 0 || task.progress_at?.elapsed() >= ETA_SAMPLE_MAX_AGE {
+            return None;
+        }
+        let rate = progress
+            .attempted_bytes_per_second
+            .filter(|rate| rate.is_finite() && *rate > 0.0)?;
+        Duration::try_from_secs_f64((remaining as f64 / rate).ceil()).ok()
+    });
+    let duration = estimate.map_or_else(|| "—".into(), format_duration);
+    Some(Line::from(format!("预计剩余 {duration}")))
 }
 
 fn current_task(tasks: &[Task]) -> Option<&Task> {
