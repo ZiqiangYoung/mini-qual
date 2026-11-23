@@ -168,6 +168,84 @@ fn running_task_eta_requires_a_fresh_positive_processing_rate() {
 }
 
 #[test]
+fn bandwidth_chart_shows_recent_samples_in_wide_and_compact_layouts() {
+    let telemetry = Telemetry::new(trial_info(Mode::Pretest));
+    telemetry.start_round(Phase::Wear, 1, 10_000 * MB, 10_000 * MB);
+    telemetry.stage_started(StageKind::Read);
+    for rate in [9_500.0, 2_500.0, 1_500.0, 0.0] {
+        telemetry.io_progress(IoProgress {
+            attempted_bytes: 4_000 * MB,
+            successful_bytes: 3_000 * MB,
+            bytes_per_second: Some(rate * MB as f64),
+            attempted_bytes_per_second: Some(1_000.0 * MB as f64),
+            ..IoProgress::default()
+        });
+    }
+    let mut snapshot = telemetry.snapshot().unwrap();
+    let now = Instant::now();
+    for (sample, age) in snapshot.tasks[3]
+        .recent_bandwidth
+        .iter_mut()
+        .zip([61, 8, 6, 2])
+    {
+        sample.observed_at = now - Duration::from_secs(age);
+    }
+
+    for (width, height) in [(120, 30), (100, 25), (80, 24)] {
+        let contents = screen(width, height, &snapshot, false);
+        for expected in ["−10 s", "现在", "2.5 GB/s", "预计剩余 00:00:06", "壳温"] {
+            assert!(
+                contents.contains(expected),
+                "{expected} missing from {contents}"
+            );
+        }
+        assert!(!contents.contains("9.5 GB/s"), "{contents}");
+        assert!(
+            contents.contains(|ch| matches!(ch, '\u{2801}'..='\u{28ff}')),
+            "{contents}"
+        );
+    }
+
+    let short = screen(80, 12, &snapshot, false);
+    assert!(short.contains("预计剩余 00:00:06"), "{short}");
+    assert!(short.contains("近期 0 MB/s"), "{short}");
+    assert!(!short.contains("−10 s"), "{short}");
+}
+
+#[test]
+fn bandwidth_history_keeps_measured_zero_and_skips_absent_and_final_rates() {
+    let telemetry = Telemetry::new(trial_info(Mode::Pretest));
+    telemetry.start_round(Phase::Wear, 1, MB, MB);
+    telemetry.stage_started(StageKind::Trim);
+    for rate in [None, Some(-1.0), Some(f64::NAN), Some(0.0)] {
+        telemetry.io_progress(IoProgress {
+            bytes_per_second: rate,
+            ..IoProgress::default()
+        });
+    }
+    let contents = screen(80, 24, &telemetry.snapshot().unwrap(), false);
+    assert!(contents.contains("实时带宽"), "{contents}");
+    assert!(contents.contains("现在"), "{contents}");
+
+    telemetry.stage_completed(
+        StageKind::Trim,
+        Duration::from_secs(1),
+        Some(IoProgress {
+            bytes_per_second: Some(MB as f64),
+            ..IoProgress::default()
+        }),
+    );
+    telemetry.stage_started(StageKind::Write);
+    let snapshot = telemetry.snapshot().unwrap();
+    let history = &snapshot.tasks[0].recent_bandwidth;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].bytes_per_second, 0.0);
+    assert!(snapshot.tasks[1].recent_bandwidth.is_empty());
+    let contents = screen(80, 24, &snapshot, false);
+    assert!(!contents.contains("实时带宽"), "{contents}");
+}
+
+#[test]
 fn only_ctrl_c_requests_interruption() {
     assert!(is_interrupt(KeyEvent::new(
         KeyCode::Char('c'),

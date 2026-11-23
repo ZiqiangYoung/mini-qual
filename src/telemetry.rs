@@ -5,6 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TEMPERATURE_HISTORY_LIMIT: usize = 120;
+const BANDWIDTH_HISTORY_LIMIT: usize = 128;
+
+pub const BANDWIDTH_HISTORY_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -81,6 +84,12 @@ pub struct IoProgress {
     pub attempted_bytes_per_second: Option<f64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct BandwidthSample {
+    pub observed_at: Instant,
+    pub bytes_per_second: f64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Task {
     pub kind: StageKind,
@@ -90,6 +99,7 @@ pub struct Task {
     pub duration: Option<Duration>,
     pub progress: Option<IoProgress>,
     pub progress_at: Option<Instant>,
+    pub recent_bandwidth: VecDeque<BandwidthSample>,
 }
 
 impl Task {
@@ -102,6 +112,7 @@ impl Task {
             duration: None,
             progress: None,
             progress_at: None,
+            recent_bandwidth: VecDeque::new(),
         }
     }
 }
@@ -248,8 +259,21 @@ impl Telemetry {
                 .iter_mut()
                 .find(|task| task.status == StageStatus::Running)
             {
+                let observed_at = Instant::now();
                 task.progress = Some(progress);
-                task.progress_at = Some(Instant::now());
+                task.progress_at = Some(observed_at);
+                if let Some(bytes_per_second) = progress
+                    .bytes_per_second
+                    .filter(|rate| rate.is_finite() && *rate >= 0.0)
+                {
+                    if task.recent_bandwidth.len() == BANDWIDTH_HISTORY_LIMIT {
+                        task.recent_bandwidth.pop_front();
+                    }
+                    task.recent_bandwidth.push_back(BandwidthSample {
+                        observed_at,
+                        bytes_per_second,
+                    });
+                }
             }
         });
     }
