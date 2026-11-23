@@ -220,13 +220,21 @@ pub struct CapacityRange {
 }
 
 #[derive(Debug, Serialize)]
-pub struct Recommendation {
+pub struct CapacityEstimate {
     pub nand_capacity_bytes: u64,
     pub nand_capacity_step_offset: i128,
     pub budget: Budget,
     pub predicted_wear_seconds: f64,
     pub baseline_wear_seconds: f64,
     pub predicted_difference_seconds: f64,
+}
+
+#[derive(Debug)]
+pub enum CapacitySelection {
+    Recommended(CapacityEstimate),
+    NoCapacityWithinLimit {
+        minimum_legal_capacity: CapacityEstimate,
+    },
 }
 
 impl CapacityRange {
@@ -323,15 +331,15 @@ impl CapacityRange {
         host_visible_capacity_bytes: u64,
         logical_block_bytes: u64,
         model: TimingModel,
-        target_seconds: f64,
-    ) -> Result<Recommendation> {
+        limit_seconds: f64,
+    ) -> Result<CapacitySelection> {
         ensure!(
-            target_seconds.is_finite() && target_seconds > 0.0,
-            "target wear duration must be finite and positive, got {target_seconds} s"
+            limit_seconds.is_finite() && limit_seconds > 0.0,
+            "wear duration limit must be finite and positive, got {limit_seconds} s"
         );
         let (first, aligned_candidate_spacing_bytes, last_index) =
             self.aligned_candidates(host_visible_capacity_bytes, logical_block_bytes)?;
-        let candidate = |index| -> Result<Recommendation> {
+        let candidate = |index| -> Result<CapacityEstimate> {
             let nand_capacity_bytes = first + index * aligned_candidate_spacing_bytes;
             let budget = Budget::new(
                 pe,
@@ -340,37 +348,41 @@ impl CapacityRange {
                 logical_block_bytes,
             )?;
             let predicted_wear_seconds = model.predict_wear_seconds(budget);
-            Ok(Recommendation {
+            ensure!(
+                predicted_wear_seconds.is_finite() && predicted_wear_seconds >= 0.0,
+                "invalid predicted wear duration {predicted_wear_seconds} s for {nand_capacity_bytes} bytes"
+            );
+            Ok(CapacityEstimate {
                 nand_capacity_bytes,
                 nand_capacity_step_offset: (i128::from(nand_capacity_bytes)
                     - i128::from(self.pretest_nand_capacity_bytes))
                     / i128::from(self.nand_capacity_step_bytes),
                 budget,
                 predicted_wear_seconds,
-                baseline_wear_seconds: target_seconds,
-                predicted_difference_seconds: predicted_wear_seconds - target_seconds,
+                baseline_wear_seconds: limit_seconds,
+                predicted_difference_seconds: predicted_wear_seconds - limit_seconds,
             })
         };
 
+        let minimum_legal_capacity = candidate(0)?;
+        if minimum_legal_capacity.predicted_wear_seconds > limit_seconds {
+            return Ok(CapacitySelection::NoCapacityWithinLimit {
+                minimum_legal_capacity,
+            });
+        }
+
+        // More NAND increases the wear budget. Find the last capacity at or below the limit.
         let mut low = 0;
         let mut high = last_index;
         while low < high {
-            let middle = low + (high - low) / 2;
-            if candidate(middle)?.predicted_wear_seconds < target_seconds {
-                low = middle + 1;
+            let middle = low + (high - low).div_ceil(2);
+            if candidate(middle)?.predicted_wear_seconds <= limit_seconds {
+                low = middle;
             } else {
-                high = middle;
+                high = middle - 1;
             }
         }
-        let upper = candidate(low)?;
-        if low > 0 {
-            let lower = candidate(low - 1)?;
-            if lower.predicted_difference_seconds.abs() <= upper.predicted_difference_seconds.abs()
-            {
-                return Ok(lower);
-            }
-        }
-        Ok(upper)
+        Ok(CapacitySelection::Recommended(candidate(low)?))
     }
 }
 

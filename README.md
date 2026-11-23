@@ -49,7 +49,9 @@ mini-qual pretest --sn PRETEST_SSD_SN --pe 3.25 \
 
 容量推荐固定主机可见容量，只考虑逻辑块对齐、严格大于主机可见容量且位于指定范围内的候选值。候选 NAND 容量等于预测试盘当前 NAND 容量加上容量步长乘以档位偏移。例如当前容量为 4 TiB，步长为 128 GiB，档位偏移为 −2 时，候选容量为 3.75 TiB。
 
-计算先从总主机写入预算中预留一个主机可见容量用于 retention，再按整轮和尾轮预测磨损时长。整轮使用各阶段和衔接的实测平均耗时，尾轮保留整盘 TRIM、flush 和阶段衔接耗时，按字节比例估算写、读和定位耗时。推荐值与 1200 小时的差值最小，等距时取较小值。报告另列实测温度下的预测等效磨损时长。用户依照推荐修改并烧录固件。
+计算先从总主机写入预算中预留一个主机可见容量用于 retention，再按整轮和尾轮预测磨损时长。整轮使用各阶段和衔接的实测平均耗时，尾轮保留整盘 TRIM、flush 和阶段衔接耗时，按字节比例估算写、读和定位耗时。
+
+在预计磨损时长不超过 1200 小时的档位中，推荐最大的合法 NAND 容量。报告另列实测温度下的预测等效磨损时长。若最小合法档位也超时，终端和报告会给出该档位的容量、预计时长和超出上限的时长，报告中的 `recommendation` 为 `null`。获得推荐后，由用户修改并烧录固件。
 
 ## 正式运行与断电交接
 
@@ -100,7 +102,7 @@ mini-qual retention --log-dir ./qual-logs/本次运行目录 \
 | `*.fio.stdout`、`*.fio.stderr` | fio 原始输出 |
 | `*_bw.1.log` | fio 在运行时按秒采样、阶段退出时导出的带宽序列 |
 | `*errors.jsonl` | 普通读取的失败范围、细读错误、可取得的返回状态 |
-| `capacity-recommendation.json` | 预测试模型、建议 NAND 容量 `nand_capacity_bytes` 和档位偏移 `nand_capacity_step_offset` |
+| `capacity-recommendation.json` | 预测试模型与推荐容量、档位偏移和预计时长。无可行档位时，`minimum_legal_capacity` 记录最小合法档位的估算 |
 | `wear-window.json`、`retention.json` | 正式磨损窗口与 retention 建议的计算依据 |
 
 ## 验证

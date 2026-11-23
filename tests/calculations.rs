@@ -1,5 +1,5 @@
 use mini_qual::plan;
-use mini_qual::plan::{Budget, CapacityRange, RoundTiming, TimingModel};
+use mini_qual::plan::{Budget, CapacityRange, CapacitySelection, RoundTiming, TimingModel};
 use mini_qual::thermal;
 use mini_qual::thermal::{RetentionParameters, Sample, WearWindow};
 
@@ -59,8 +59,9 @@ fn recommendation_matches_enumeration_of_the_relative_capacity_grid() {
             minimum_nand_capacity_bytes: 3100,
             maximum_nand_capacity_bytes: 14_000,
         };
-        for target in [1.0_f64, 57.0, 73.0, 103.0, 130.0, 146.7, 1000.0] {
-            let expected = (range.minimum_nand_capacity_bytes..=range.maximum_nand_capacity_bytes)
+        for limit in [1.0, 57.0, 61.0, 73.0, 103.0, 130.0, 146.7, 1000.0] {
+            let candidates: Vec<_> = (range.minimum_nand_capacity_bytes
+                ..=range.maximum_nand_capacity_bytes)
                 .filter(|capacity| {
                     *capacity > host_visible_capacity_bytes && capacity % logical_block_bytes == 0
                 })
@@ -75,36 +76,112 @@ fn recommendation_matches_enumeration_of_the_relative_capacity_grid() {
                         logical_block_bytes,
                     )
                     .unwrap();
-                    (
-                        capacity,
-                        (model.predict_wear_seconds(budget) - target).abs(),
-                    )
+                    (capacity, model.predict_wear_seconds(budget))
                 })
-                .min_by(|left, right| left.1.total_cmp(&right.1));
-            let recommendation = range.recommend(
+                .collect();
+            let expected = candidates.iter().rfind(|(_, duration)| *duration <= limit);
+            let selection = range.recommend(
                 1,
                 host_visible_capacity_bytes,
                 logical_block_bytes,
                 model,
-                target,
+                limit,
             );
-            assert_eq!(
-                recommendation
-                    .as_ref()
-                    .ok()
-                    .map(|result| result.nand_capacity_bytes),
-                expected.map(|result| result.0)
-            );
-            if let Ok(recommendation) = recommendation {
-                assert_eq!(
-                    i128::from(recommendation.nand_capacity_bytes),
-                    i128::from(pretest_nand_capacity_bytes)
-                        + recommendation.nand_capacity_step_offset
-                            * i128::from(nand_capacity_step_bytes)
-                );
+            match (selection, expected, candidates.first()) {
+                (Ok(CapacitySelection::Recommended(estimate)), Some(&(capacity, duration)), _) => {
+                    assert_eq!(estimate.nand_capacity_bytes, capacity);
+                    assert_eq!(estimate.predicted_wear_seconds, duration);
+                    assert_eq!(
+                        i128::from(estimate.nand_capacity_bytes),
+                        i128::from(pretest_nand_capacity_bytes)
+                            + estimate.nand_capacity_step_offset
+                                * i128::from(nand_capacity_step_bytes)
+                    );
+                }
+                (
+                    Ok(CapacitySelection::NoCapacityWithinLimit {
+                        minimum_legal_capacity,
+                    }),
+                    None,
+                    Some(&(capacity, duration)),
+                ) => {
+                    assert_eq!(minimum_legal_capacity.nand_capacity_bytes, capacity);
+                    assert_eq!(minimum_legal_capacity.predicted_wear_seconds, duration);
+                    assert_eq!(
+                        minimum_legal_capacity.predicted_difference_seconds,
+                        duration - limit
+                    );
+                }
+                (Err(_), None, None) => (),
+                other => panic!("unexpected result at limit {limit}: {other:?}"),
             }
         }
     }
+}
+
+#[test]
+fn enforces_the_1200_hour_limit_for_a_3_84_tb_device() -> anyhow::Result<()> {
+    let host_visible_capacity_bytes = plan::parse_capacity("3.84TB")?;
+    let seconds_per_full_io = host_visible_capacity_bytes as f64 / 3_400_000_000.0;
+    let round = RoundTiming {
+        write_seconds: seconds_per_full_io,
+        read_seconds: seconds_per_full_io,
+        ..RoundTiming::default()
+    };
+    let model = TimingModel::from_rounds(&[round, round])?;
+    let range = CapacityRange {
+        pretest_nand_capacity_bytes: plan::parse_capacity("4.096TB")?,
+        nand_capacity_step_bytes: plan::parse_capacity("128GB")?,
+        minimum_nand_capacity_bytes: host_visible_capacity_bytes,
+        maximum_nand_capacity_bytes: plan::parse_capacity("5TB")?,
+    };
+    let limit = thermal::ENDURANCE_REFERENCE_DURATION_SECONDS;
+    let logical_block_bytes = 512;
+    let pe = plan::parse_pe("1.8K")?;
+    let CapacitySelection::Recommended(estimate) = range.recommend(
+        pe,
+        host_visible_capacity_bytes,
+        logical_block_bytes,
+        model,
+        limit,
+    )?
+    else {
+        panic!("the 3.968 TB capacity fits in 1200 hours");
+    };
+    assert_eq!(
+        estimate.nand_capacity_bytes,
+        plan::parse_capacity("3.968TB")?
+    );
+    assert!(estimate.predicted_wear_seconds < limit);
+    // The next step is closer to 1200 hours in absolute terms, but exceeds the limit.
+    let next_budget = Budget::new(
+        pe,
+        range.pretest_nand_capacity_bytes,
+        host_visible_capacity_bytes,
+        logical_block_bytes,
+    )?;
+    let next_seconds = model.predict_wear_seconds(next_budget);
+    assert!(next_seconds > limit);
+    assert!(next_seconds - limit < limit - estimate.predicted_wear_seconds);
+
+    let CapacitySelection::NoCapacityWithinLimit {
+        minimum_legal_capacity,
+    } = range.recommend(
+        plan::parse_pe("3.25K")?,
+        host_visible_capacity_bytes,
+        logical_block_bytes,
+        model,
+        limit,
+    )?
+    else {
+        panic!("even the minimum legal capacity exceeds 1200 hours at 3250 cycles");
+    };
+    assert_eq!(
+        minimum_legal_capacity.nand_capacity_bytes,
+        estimate.nand_capacity_bytes
+    );
+    assert!(minimum_legal_capacity.predicted_wear_seconds > 2_000.0 * 3600.0);
+    Ok(())
 }
 
 #[test]

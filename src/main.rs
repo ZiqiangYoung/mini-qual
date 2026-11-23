@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Args, Parser, Subcommand};
 use mini_qual::plan;
-use mini_qual::plan::{Budget, CapacityRange, Recommendation, RoundTiming, TimingModel};
+use mini_qual::plan::{Budget, CapacityRange, CapacitySelection, RoundTiming, TimingModel};
 use mini_qual::thermal;
 use mini_qual::thermal::{RetentionParameters, WearWindow};
 use mini_qual::worker::{Outcome, Worker};
@@ -41,7 +41,7 @@ struct Cli {
 enum Command {
     /// 按写入预算磨损，准备 retention 数据，并向断电协调服务交接
     Run(RunArgs),
-    /// 在专用盘上持续预测试，Ctrl+C 后用完整轮次推荐 NAND 物理容量
+    /// 在专用盘上持续预测试，Ctrl+C 后按磨损时限推荐 NAND 物理容量
     Pretest(PretestArgs),
     /// 使用正式运行保存的实测壳温时间线重新计算 retention 建议
     Retention(RetentionArgs),
@@ -465,7 +465,7 @@ fn formal_io(
 
 enum PretestSummary {
     Insufficient(usize),
-    Recommended(Recommendation),
+    Assessed(CapacitySelection),
 }
 
 fn pretest(args: PretestArgs) -> Result<()> {
@@ -562,36 +562,49 @@ fn pretest(args: PretestArgs) -> Result<()> {
             ),
             Err(error) => (None, Some(format!("{error:#}"))),
         };
-        let recommendation = range.recommend(
+        let capacity_selection = range.recommend(
             args.device.pe,
             device.host_visible_capacity_bytes,
             device.logical_block_bytes,
             model,
             thermal::ENDURANCE_REFERENCE_DURATION_SECONDS,
         )?;
+        let (event, recommendation, minimum_legal_capacity) = match &capacity_selection {
+            CapacitySelection::Recommended(estimate) => {
+                ("capacity_recommendation", Some(estimate), None)
+            }
+            CapacitySelection::NoCapacityWithinLimit {
+                minimum_legal_capacity,
+            } => (
+                "no_capacity_within_limit",
+                None,
+                Some(minimum_legal_capacity),
+            ),
+        };
         let report = json!({
             "host_visible_capacity_bytes": device.host_visible_capacity_bytes,
             "pe": args.device.pe,
             "range": range,
             "model": model,
             "recommendation": recommendation,
+            "minimum_legal_capacity": minimum_legal_capacity,
             "predicted_equivalent_wear_seconds_at_measured_temperatures":
-                equivalent_rate.map(|rate| rate * recommendation.predicted_wear_seconds),
+                recommendation.zip(equivalent_rate).map(|(estimate, rate)| rate * estimate.predicted_wear_seconds),
             "completed_rounds_temperature_window": window,
             "measured_equivalent_to_elapsed_ratio": equivalent_rate,
             "temperature_calculation_error": temperature_error,
             "endurance_reference_temperature_c": thermal::ENDURANCE_REFERENCE_TEMPERATURE_C,
         });
         trial.log.report("capacity-recommendation.json", &report)?;
-        trial.log.event("capacity_recommendation", report)?;
-        Ok(PretestSummary::Recommended(recommendation))
+        trial.log.event(event, report)?;
+        Ok(PretestSummary::Assessed(capacity_selection))
     })();
     dashboard.finish();
     let result = result.map(|summary| match summary {
         PretestSummary::Insufficient(rounds) => {
             eprintln!("预测试数据不足，已完成 {rounds} 轮，容量估算至少需要两轮。");
         }
-        PretestSummary::Recommended(recommendation) => {
+        PretestSummary::Assessed(CapacitySelection::Recommended(recommendation)) => {
             println!(
                 "推荐 NAND 物理容量 {} Byte，档位偏移 {:+}，当前主机可见容量 {} Byte。",
                 recommendation.nand_capacity_bytes,
@@ -599,10 +612,26 @@ fn pretest(args: PretestArgs) -> Result<()> {
                 device.host_visible_capacity_bytes
             );
             println!(
-                "预计磨损 {:.6} 小时，企业级基准 {:.0} 小时，差值 {:+.6} 小时。",
+                "预计磨损 {:.6} 小时，距离 {:.0} 小时上限还有 {:.6} 小时。",
                 recommendation.predicted_wear_seconds / 3600.0,
-                thermal::ENDURANCE_REFERENCE_DURATION_SECONDS / 3600.0,
-                recommendation.predicted_difference_seconds / 3600.0
+                recommendation.baseline_wear_seconds / 3600.0,
+                (recommendation.baseline_wear_seconds - recommendation.predicted_wear_seconds)
+                    / 3600.0
+            );
+        }
+        PretestSummary::Assessed(CapacitySelection::NoCapacityWithinLimit { minimum_legal_capacity }) => {
+            eprintln!(
+                "按完整轮次实测耗时估算，在当前主机可见容量 {} Byte、PE {} 次和容量档位约束下，无容量可在 {:.0} 小时内完成磨损。",
+                device.host_visible_capacity_bytes,
+                args.device.pe,
+                minimum_legal_capacity.baseline_wear_seconds / 3600.0
+            );
+            eprintln!(
+                "最小合法 NAND 物理容量 {} Byte，档位偏移 {:+}，预计磨损 {:.6} 小时，超出上限 {:.6} 小时。",
+                minimum_legal_capacity.nand_capacity_bytes,
+                minimum_legal_capacity.nand_capacity_step_offset,
+                minimum_legal_capacity.predicted_wear_seconds / 3600.0,
+                minimum_legal_capacity.predicted_difference_seconds / 3600.0
             );
         }
     });
