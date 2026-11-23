@@ -6,6 +6,7 @@ case "${1:-}" in
     --enghelp=libaio) exit 0 ;;
 esac
 
+live=0
 for argument do
     case "$argument" in
         --name=*) name=${argument#*=} ;;
@@ -19,6 +20,7 @@ for argument do
         --ioengine=libaio) asynchronous=1 ;;
         --iodepth=*) depth=${argument#*=} ;;
         --verify=0) no_verify=1 ;;
+        --status-interval=1) live=1 ;;
     esac
 done
 
@@ -39,6 +41,17 @@ case "$name" in
         printf 'fio: cannot open namespace for writing: Permission denied\n' >&2
         exit 1
         ;;
+    *-round-000004-write)
+        test "$live" -eq 1
+        printf '{"snapshot":true,"jobs":[{"jobname":"%s","error":0,"write":{"io_bytes":%s}}]}\n' "$name" "$size"
+        printf '{"jobs":['
+        exit 0
+        ;;
+    *-round-000005-write)
+        test "$live" -eq 1
+        printf '{"snapshot":true,"jobs":[{"jobname":"%s","error":0,"write":{"io_bytes":%s}}]}\n' "$name" "$size"
+        kill -KILL "$$"
+        ;;
     *-read)
         printf 'fio: io_u error on file %s: Input/output error: read offset=0, buflen=131072\n' "$file" >&2
         printf 'fio: io_u error on file %s: No data available: read offset=131072, buflen=131072\n' "$file" >&2
@@ -48,5 +61,15 @@ case "$name" in
         ;;
 esac
 
-printf '{"jobs":[{"error":%s,"total_err":%s,"%s":{"io_bytes":%s}}]}\n' \
-    "$errno" "$errors" "$operation" "$completed"
+if test "$live" -eq 1; then
+    case "$name" in
+        *-trim-tail) ;;
+        *)
+            printf '{\n  "snapshot":"braces } { in a string",\n  "jobs":[{"jobname":"%s","error":0,"%s":{"io_bytes":0}}]\n}\n' "$name" "$operation"
+            printf '{"snapshot":true,"jobs":[{"jobname":"%s","error":0,"%s":{"io_bytes":%s}}]}\n' "$name" "$operation" "$completed"
+            ;;
+    esac
+fi
+
+printf '{"jobs":[{"jobname":"%s","error":%s,"total_err":%s,"%s":{"io_bytes":%s}}]}\n' \
+    "$name" "$errno" "$errors" "$operation" "$completed"

@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
+use crate::telemetry::{Mode, Telemetry, TrialInfo};
+
 use super::{TemperatureSource, read_samples};
 
 #[test]
@@ -64,13 +66,23 @@ fn records_raw_temperature_from_http_get_and_closes_the_sampler() {
     });
     let folder = std::env::temp_dir().join(format!("mini-qual-temperature-{}", Uuid::new_v4()));
     fs::create_dir(&folder).unwrap();
+    let started = Instant::now();
+    let telemetry = Telemetry::new(TrialInfo {
+        mode: Mode::Pretest,
+        serial: "temperature-fixture".into(),
+        device_path: "/dev/mock".into(),
+        log_dir: folder.clone(),
+        started,
+        total_wear_rounds: None,
+        total_write_budget_bytes: None,
+    });
     let monitor = TemperatureSource::new(
         &endpoint,
         Some("/data/value_c".into()),
         Duration::from_secs(60),
     )
     .unwrap()
-    .start(&folder, Instant::now(), false)
+    .start(&folder, started, false, telemetry.clone())
     .unwrap();
     monitor.finish().unwrap();
     thread.join().unwrap();
@@ -82,4 +94,7 @@ fn records_raw_temperature_from_http_get_and_closes_the_sampler() {
     assert_eq!(record["http_status"], 200);
     assert_eq!(samples.len(), 1);
     assert_eq!(samples[0].measured_case_temperature_c, 76.75);
+    let latest = telemetry.snapshot().unwrap().temperature.latest.unwrap();
+    assert_eq!(latest.value, Ok(76.75));
+    assert_eq!(latest.query_time, record["query_time"].as_str().unwrap());
 }

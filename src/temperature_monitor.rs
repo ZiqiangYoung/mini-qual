@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::run_log;
+use crate::telemetry::Telemetry;
 
 #[cfg(test)]
 #[path = "../tests/temperature/mod.rs"]
@@ -72,6 +73,7 @@ impl TemperatureSource {
         log_dir: &Path,
         started: Instant,
         print_each: bool,
+        telemetry: Telemetry,
     ) -> Result<TemperatureMonitor> {
         let path = log_dir.join("temperature.jsonl");
         let file = File::create_new(&path)
@@ -106,7 +108,9 @@ impl TemperatureSource {
                             .map_err(|error| format!("{error:#}")),
                         (None, None) => Err("response body missing".to_string()),
                     };
-                    if print_each {
+                    if telemetry.is_active() {
+                        telemetry.temperature(&query_time, elapsed_seconds, &parsed);
+                    } else if print_each {
                         match &parsed {
                             Ok(value) => eprintln!("[{query_time}] SSD 外壳温度 {value:.2}°C"),
                             Err(error) => eprintln!("[{query_time}] SSD 外壳温度查询失败 {error}"),

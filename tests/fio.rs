@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::device::Device;
 use crate::fio::Fio;
+use crate::telemetry::Telemetry;
 
 // Tests the production fio runner without constructing a real NVMe namespace.
 #[path = "../src/fio.rs"]
@@ -69,6 +70,33 @@ mod device {
     }
 }
 
+mod telemetry {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct IoProgress {
+        pub attempted_bytes: u64,
+        pub successful_bytes: u64,
+        pub errors: u64,
+        pub bytes_per_second: Option<f64>,
+    }
+
+    #[derive(Default, Clone)]
+    pub struct Telemetry(pub Option<Arc<Mutex<Vec<IoProgress>>>>);
+
+    impl Telemetry {
+        pub fn is_active(&self) -> bool {
+            self.0.is_some()
+        }
+
+        pub fn io_progress(&self, progress: IoProgress) {
+            if let Some(samples) = &self.0 {
+                samples.lock().unwrap().push(progress);
+            }
+        }
+    }
+}
+
 struct TestDirectory(PathBuf);
 
 impl Drop for TestDirectory {
@@ -77,8 +105,7 @@ impl Drop for TestDirectory {
     }
 }
 
-#[test]
-fn sequential_io_preserves_aligned_tails_and_recovered_read_errors() -> Result<()> {
+fn fio_fixture() -> Result<(TestDirectory, PathBuf, Device)> {
     let directory =
         TestDirectory(std::env::temp_dir().join(format!("mini-qual-fio-{}", Uuid::new_v4())));
     fs::create_dir(&directory.0)?;
@@ -92,6 +119,12 @@ fn sequential_io_preserves_aligned_tails_and_recovered_read_errors() -> Result<(
         logical_block_bytes: 4096,
         maximum_discard_request_bytes: 262144,
     };
+    Ok((directory, program, device))
+}
+
+#[test]
+fn sequential_io_preserves_aligned_tails_and_recovered_read_errors() -> Result<()> {
+    let (directory, program, device) = fio_fixture()?;
     let stop = AtomicBool::new(false);
     let fio = Fio::new(program, directory.0.clone(), &device, &stop)?;
     let trim = fio.trim("pretest", 1)?;
@@ -158,5 +191,68 @@ fn sequential_io_preserves_aligned_tails_and_recovered_read_errors() -> Result<(
             .contains("cannot open namespace for writing: Permission denied"),
         "{error:#}"
     );
+    Ok(())
+}
+
+#[test]
+fn live_status_keeps_only_final_reports_and_merges_read_tail_progress() -> Result<()> {
+    let (directory, program, device) = fio_fixture()?;
+    let stop = AtomicBool::new(false);
+    let samples = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let fio = Fio::new(program, directory.0.clone(), &device, &stop)?
+        .with_telemetry(Telemetry(Some(samples.clone())));
+    let trim = fio.trim("wear", 1)?;
+    assert_eq!(trim.successful_bytes, device.host_visible_capacity_bytes);
+    samples.lock().unwrap().clear();
+
+    let read = fio.read("wear", 1, device.host_visible_capacity_bytes)?;
+    assert_eq!(read.attempted_bytes, device.host_visible_capacity_bytes);
+    assert_eq!(read.successful_bytes, 4096);
+    assert_eq!(read.errors, 2);
+
+    for stage in ["trim", "trim-tail", "read", "read-tail"] {
+        let output = fs::read(
+            directory
+                .0
+                .join(format!("wear-round-000001-{stage}.fio.stdout")),
+        )?;
+        let final_report: Value = serde_json::from_slice(&output)?;
+        assert!(final_report.get("snapshot").is_none());
+        assert_eq!(
+            final_report["jobs"][0]["jobname"],
+            format!("wear-round-000001-{stage}")
+        );
+    }
+    assert!(samples.lock().unwrap().iter().any(|sample| {
+        sample.attempted_bytes == device.host_visible_capacity_bytes
+            && sample.successful_bytes == 4096
+            && sample.errors == 2
+            && sample.bytes_per_second.is_some_and(|rate| rate > 0.0)
+    }));
+    Ok(())
+}
+
+#[test]
+fn failed_fio_capture_never_persists_a_previous_complete_snapshot() -> Result<()> {
+    let (directory, program, device) = fio_fixture()?;
+    let stop = AtomicBool::new(false);
+    let fio = Fio::new(program, directory.0.clone(), &device, &stop)?
+        .with_telemetry(Telemetry(Some(Default::default())));
+    for (round, expected_error) in [
+        (4, "fio stdout ended within the final JSON report"),
+        (5, "signal: 9"),
+    ] {
+        let error = fio
+            .write("wear", round, device.host_visible_capacity_bytes)
+            .expect_err("a completed snapshot cannot replace the final report");
+        let error = format!("{error:#}");
+        assert!(error.contains(expected_error), "{error}");
+        let raw = fs::read_to_string(
+            directory
+                .0
+                .join(format!("wear-round-{round:06}-write.fio.stdout")),
+        )?;
+        assert!(raw.is_empty(), "unexpected persisted snapshot: {raw}");
+    }
     Ok(())
 }

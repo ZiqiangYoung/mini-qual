@@ -1,6 +1,8 @@
+mod dashboard;
 mod device;
 mod fio;
 mod run_log;
+mod telemetry;
 mod temperature_monitor;
 
 use std::fs::File;
@@ -13,17 +15,19 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Args, Parser, Subcommand};
 use mini_qual::plan;
-use mini_qual::plan::{Budget, CapacityRange, RoundTiming, TimingModel};
+use mini_qual::plan::{Budget, CapacityRange, Recommendation, RoundTiming, TimingModel};
 use mini_qual::thermal;
 use mini_qual::thermal::{RetentionParameters, WearWindow};
 use mini_qual::worker::{Outcome, Worker};
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::dashboard::Dashboard;
 use crate::device::Device;
 use crate::device::DeviceLease;
 use crate::fio::Fio;
 use crate::run_log::RunLog;
+use crate::telemetry::{IoProgress, Mode, Phase, StageKind, Telemetry, TrialInfo};
 use crate::temperature_monitor::TemperatureSource;
 
 #[derive(Parser)]
@@ -66,6 +70,9 @@ struct DeviceArgs {
     /// 温度查询间隔，单位秒
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=86400))]
     temperature_sample_interval_seconds: u64,
+    /// 在交互终端中也使用文本输出
+    #[arg(long)]
+    no_tui: bool,
 }
 
 #[derive(Args)]
@@ -224,6 +231,32 @@ fn temperature_source(args: &DeviceArgs) -> Result<TemperatureSource> {
     )
 }
 
+fn open_dashboard(
+    args: &DeviceArgs,
+    device: &Device,
+    log: &RunLog,
+    budget: Option<Budget>,
+    stop: &Arc<AtomicBool>,
+) -> Dashboard {
+    let info = TrialInfo {
+        mode: if budget.is_some() {
+            Mode::Run
+        } else {
+            Mode::Pretest
+        },
+        serial: device.serial.clone(),
+        device_path: device.path.clone(),
+        log_dir: log.dir.clone(),
+        started: log.started,
+        total_wear_rounds: budget
+            .map(|budget| budget.full_rounds + u128::from(budget.final_partial_round_blocks > 0)),
+        total_write_budget_bytes: budget.map(|budget| {
+            budget.total_host_write_budget_blocks * u128::from(device.logical_block_bytes)
+        }),
+    };
+    Dashboard::start(args.no_tui, info, Arc::clone(stop))
+}
+
 fn run(args: RunArgs) -> Result<()> {
     let stop = install_signal_handlers()?;
     let parameters = RetentionParameters::from(&args.retention);
@@ -238,6 +271,8 @@ fn run(args: RunArgs) -> Result<()> {
     )?;
     let ownership = device.acquire()?;
     let mut log = open_log(&args.device, &device, &ownership, "run")?;
+    let mut dashboard = open_dashboard(&args.device, &device, &log, Some(budget), &stop);
+    let telemetry = dashboard.telemetry().clone();
     let setup = (|| {
         log.event(
             "wear_parameters",
@@ -249,8 +284,11 @@ fn run(args: RunArgs) -> Result<()> {
                 "run_id": args.run_id,
             }),
         )?;
-        let fio = Fio::new(args.device.fio.clone(), log.dir.clone(), &device, &stop)?;
+        telemetry.message("正在检查 fio");
+        let fio = Fio::new(args.device.fio.clone(), log.dir.clone(), &device, &stop)?
+            .with_telemetry(telemetry.clone());
         check_running(&stop)?;
+        telemetry.message("等待断电协调器确认注册");
         let worker = Worker::register(
             &args.coordinator,
             args.run_id,
@@ -267,9 +305,12 @@ fn run(args: RunArgs) -> Result<()> {
     })();
     let (fio, worker) = match setup {
         Ok(setup) => setup,
-        Err(error) => return seal_trial(&mut log, Err(error)),
+        Err(error) => {
+            dashboard.finish();
+            return seal_trial(&mut log, Err(error));
+        }
     };
-    let operation: Result<()> = (|| {
+    let operation = (|| -> Result<_> {
         log.event(
             "poweroff_registered",
             json!({"instance_id": worker.instance_id(), "timing": worker.timing()}),
@@ -277,7 +318,8 @@ fn run(args: RunArgs) -> Result<()> {
         log.sync()?;
         worker.check_active()?;
         check_running(&stop)?;
-        let monitor = source.start(&log.dir, log.started, false)?;
+        telemetry.message("正在查询首个壳温样本");
+        let monitor = source.start(&log.dir, log.started, false, telemetry.clone())?;
         let result = formal_io(
             &mut log,
             &device,
@@ -285,6 +327,7 @@ fn run(args: RunArgs) -> Result<()> {
             &stop,
             budget,
             args.device.temperature_sample_interval_seconds,
+            &telemetry,
         );
         let sampler_result = monitor.finish();
         let window = result?;
@@ -295,6 +338,10 @@ fn run(args: RunArgs) -> Result<()> {
             .context("calculating retention duration from the recorded case temperatures")?;
         log.report("retention.json", &estimate)?;
         log.event("retention_estimate", serde_json::to_value(&estimate)?)?;
+        Ok(estimate)
+    })();
+    dashboard.finish();
+    let operation = operation.and_then(|estimate| {
         println!(
             "建议断电 retention {:.6} 小时（{:.3}°C）；实测等效磨损 {:.6} 小时（{:.1}°C）。",
             estimate.recommended_hours,
@@ -303,9 +350,8 @@ fn run(args: RunArgs) -> Result<()> {
             thermal::ENDURANCE_REFERENCE_TEMPERATURE_C
         );
         std::io::Write::flush(&mut std::io::stdout())?;
-        worker.check_active()?;
-        Ok(())
-    })();
+        worker.check_active()
+    });
     drop(ownership);
     let operation = match (operation, worker.check_active()) {
         (Err(error), Err(coordinator)) => Err(anyhow!(
@@ -351,12 +397,14 @@ fn formal_io(
     stop: &AtomicBool,
     budget: Budget,
     temperature_sample_interval_seconds: u64,
+    telemetry: &Telemetry,
 ) -> Result<WearWindow> {
     let mut trial = Trial {
         log,
         device,
         fio,
         stop,
+        telemetry,
         written_blocks: 0,
     };
     let wear_started = trial.log.started.elapsed().as_secs_f64();
@@ -385,10 +433,13 @@ fn formal_io(
     trial
         .log
         .event("wear_finished", serde_json::to_value(window)?)?;
+    let retention_round = rounds + 1;
+    let host_bytes = device.host_visible_capacity_bytes;
+    telemetry.start_round(Phase::Retention, retention_round, host_bytes, host_bytes);
     let preparation = (|| {
-        trial.trim("retention", rounds + 1)?;
-        trial.write("retention", rounds + 1, device.host_visible_capacity_bytes)?;
-        trial.flush("retention", rounds + 1)?;
+        trial.trim(Phase::Retention, retention_round)?;
+        trial.write(Phase::Retention, retention_round, host_bytes)?;
+        trial.flush(Phase::Retention, retention_round)?;
         ensure!(
             trial.written_blocks == budget.total_host_write_budget_blocks,
             "trial wrote {} logical blocks, expected {} in the total host write budget",
@@ -407,7 +458,14 @@ fn formal_io(
             "cumulative_written_blocks": trial.written_blocks,
         }),
     )?;
+    telemetry.stage_started(StageKind::Handoff);
+    telemetry.message("已 flush，正在保存结果并准备交接");
     Ok(window)
+}
+
+enum PretestSummary {
+    Insufficient(usize),
+    Recommended(Recommendation),
 }
 
 fn pretest(args: PretestArgs) -> Result<()> {
@@ -433,15 +491,21 @@ fn pretest(args: PretestArgs) -> Result<()> {
     )?;
     let ownership = device.acquire()?;
     let mut log = open_log(&args.device, &device, &ownership, "pretest")?;
-    let result = (|| {
+    let mut dashboard = open_dashboard(&args.device, &device, &log, None, &stop);
+    let telemetry = dashboard.telemetry().clone();
+    let result = (|| -> Result<_> {
         log.event("capacity_parameters", serde_json::to_value(range)?)?;
-        let fio = Fio::new(args.device.fio.clone(), log.dir.clone(), &device, &stop)?;
-        let monitor = source.start(&log.dir, log.started, true)?;
+        telemetry.message("正在检查 fio");
+        let fio = Fio::new(args.device.fio.clone(), log.dir.clone(), &device, &stop)?
+            .with_telemetry(telemetry.clone());
+        telemetry.message("正在查询首个壳温样本");
+        let monitor = source.start(&log.dir, log.started, true, telemetry.clone())?;
         let mut trial = Trial {
             log: &mut log,
             device: &device,
             fio: &fio,
             stop: &stop,
+            telemetry: &telemetry,
             written_blocks: 0,
         };
         let mut timings = Vec::new();
@@ -474,16 +538,13 @@ fn pretest(args: PretestArgs) -> Result<()> {
         let sampler_result = monitor.finish();
         work_result?;
         sampler_result?;
+        telemetry.message("正在整理预测试结果");
         if timings.len() < 2 {
             trial.log.event(
                 "insufficient_pretest",
                 json!({"complete_rounds": timings.len()}),
             )?;
-            eprintln!(
-                "预测试数据不足，已完成 {} 轮，容量估算至少需要两轮。",
-                timings.len()
-            );
-            return Ok(());
+            return Ok(PretestSummary::Insufficient(timings.len()));
         }
         let model = TimingModel::from_rounds(&timings)?;
         let window = WearWindow {
@@ -523,20 +584,28 @@ fn pretest(args: PretestArgs) -> Result<()> {
         });
         trial.log.report("capacity-recommendation.json", &report)?;
         trial.log.event("capacity_recommendation", report)?;
-        println!(
-            "推荐 NAND 物理容量 {} Byte，档位偏移 {:+}，当前主机可见容量 {} Byte。",
-            recommendation.nand_capacity_bytes,
-            recommendation.nand_capacity_step_offset,
-            device.host_visible_capacity_bytes
-        );
-        println!(
-            "预计磨损 {:.6} 小时，企业级基准 {:.0} 小时，差值 {:+.6} 小时。",
-            recommendation.predicted_wear_seconds / 3600.0,
-            thermal::ENDURANCE_REFERENCE_DURATION_SECONDS / 3600.0,
-            recommendation.predicted_difference_seconds / 3600.0
-        );
-        Ok(())
+        Ok(PretestSummary::Recommended(recommendation))
     })();
+    dashboard.finish();
+    let result = result.map(|summary| match summary {
+        PretestSummary::Insufficient(rounds) => {
+            eprintln!("预测试数据不足，已完成 {rounds} 轮，容量估算至少需要两轮。");
+        }
+        PretestSummary::Recommended(recommendation) => {
+            println!(
+                "推荐 NAND 物理容量 {} Byte，档位偏移 {:+}，当前主机可见容量 {} Byte。",
+                recommendation.nand_capacity_bytes,
+                recommendation.nand_capacity_step_offset,
+                device.host_visible_capacity_bytes
+            );
+            println!(
+                "预计磨损 {:.6} 小时，企业级基准 {:.0} 小时，差值 {:+.6} 小时。",
+                recommendation.predicted_wear_seconds / 3600.0,
+                thermal::ENDURANCE_REFERENCE_DURATION_SECONDS / 3600.0,
+                recommendation.predicted_difference_seconds / 3600.0
+            );
+        }
+    });
     drop(ownership);
     seal_trial(&mut log, result)
 }
@@ -587,6 +656,7 @@ struct Trial<'a> {
     device: &'a Device,
     fio: &'a Fio<'a>,
     stop: &'a AtomicBool,
+    telemetry: &'a Telemetry,
     written_blocks: u128,
 }
 
@@ -602,16 +672,22 @@ impl Trial<'_> {
         self.log.event("round_started", json!({
             "round": round, "write_bytes": bytes, "read_bytes": bytes, "round_gap_seconds": round_gap_seconds,
         }))?;
-        let phase = "wear";
+        let phase = Phase::Wear;
+        self.telemetry
+            .start_round(phase, round, self.device.host_visible_capacity_bytes, bytes);
         let trim_seconds = self.trim(phase, round)?;
         let write_seconds = self.write(phase, round, bytes)?;
         let flush_seconds = self.flush(phase, round)?;
         let read_seconds = self
-            .fio_stage(phase, round, "read", |fio| fio.read(phase, round, bytes))?
+            .fio_stage(phase, round, StageKind::Read, |fio| {
+                fio.read(phase.name(), round, bytes)
+            })?
             .duration
             .as_secs_f64();
         let locate_seconds = self
-            .fio_stage(phase, round, "locate", |fio| fio.locate(phase, round))?
+            .fio_stage(phase, round, StageKind::Locate, |fio| {
+                fio.locate(phase.name(), round)
+            })?
             .duration
             .as_secs_f64();
         let ended = std::time::Instant::now();
@@ -635,18 +711,24 @@ impl Trial<'_> {
                 "timing": timing,
             }),
         )?;
+        self.telemetry.round_completed(round);
         Ok((timing, ended))
     }
 
-    fn trim(&mut self, phase: &str, round: u128) -> Result<f64> {
+    fn trim(&mut self, phase: Phase, round: u128) -> Result<f64> {
         Ok(self
-            .fio_stage(phase, round, "trim", |fio| fio.trim(phase, round))?
+            .fio_stage(phase, round, StageKind::Trim, |fio| {
+                fio.trim(phase.name(), round)
+            })?
             .duration
             .as_secs_f64())
     }
 
-    fn write(&mut self, phase: &str, round: u128, bytes: u64) -> Result<f64> {
-        let stage = self.fio_stage(phase, round, "write", |fio| fio.write(phase, round, bytes))?;
+    fn write(&mut self, phase: Phase, round: u128, bytes: u64) -> Result<f64> {
+        let stage = self.fio_stage(phase, round, StageKind::Write, |fio| {
+            fio.write(phase.name(), round, bytes)
+        })?;
+        let phase = phase.name();
         ensure!(
             stage.successful_bytes == bytes,
             "fio wrote {} bytes during {phase} round {round}, expected {bytes} bytes",
@@ -663,68 +745,91 @@ impl Trial<'_> {
         Ok(stage.duration.as_secs_f64())
     }
 
-    fn flush(&mut self, phase: &str, round: u128) -> Result<f64> {
-        self.stage_start(phase, round, "flush")?;
+    fn flush(&mut self, phase: Phase, round: u128) -> Result<f64> {
+        self.stage_start(phase, round, StageKind::Flush)?;
         let started = Instant::now();
         if let Err(error) = self.device.flush() {
-            return self.stage_error(phase, round, "flush", error);
+            return self.stage_error(phase, round, StageKind::Flush, error);
         }
-        let duration = started.elapsed().as_secs_f64();
+        let duration = started.elapsed();
         self.log.event(
             "stage_finished",
             json!({
-                "phase": phase, "round": round, "operation": "flush", "seconds": duration,
+                "phase": phase.name(), "round": round, "operation": "flush", "seconds": duration.as_secs_f64(),
             }),
         )?;
-        Ok(duration)
+        self.telemetry
+            .stage_completed(StageKind::Flush, duration, None);
+        Ok(duration.as_secs_f64())
     }
 
     fn fio_stage(
         &mut self,
-        phase: &str,
+        phase: Phase,
         round: u128,
-        operation: &str,
+        kind: StageKind,
         action: impl FnOnce(&Fio<'_>) -> Result<fio::Stage>,
     ) -> Result<fio::Stage> {
-        self.stage_start(phase, round, operation)?;
+        self.stage_start(phase, round, kind)?;
         let stage = match action(self.fio) {
             Ok(stage) => stage,
-            Err(error) => return self.stage_error(phase, round, operation, error),
+            Err(error) => return self.stage_error(phase, round, kind, error),
         };
         let seconds = stage.duration.as_secs_f64();
+        let successful_bytes_per_second =
+            (seconds > 0.0).then(|| stage.successful_bytes as f64 / seconds);
         self.log.event("stage_finished", json!({
-            "phase": phase, "round": round, "operation": operation,
+            "phase": phase.name(), "round": round, "operation": kind.name(),
             "seconds": seconds,
             "attempted_bytes": stage.attempted_bytes, "successful_bytes": stage.successful_bytes,
             "error_count": stage.errors,
             "attempted_bytes_per_second": (seconds > 0.0).then(|| stage.attempted_bytes as f64 / seconds),
-            "successful_bytes_per_second": (seconds > 0.0).then(|| stage.successful_bytes as f64 / seconds),
+            "successful_bytes_per_second": successful_bytes_per_second,
         }))?;
+        self.telemetry.stage_completed(
+            kind,
+            stage.duration,
+            Some(IoProgress {
+                attempted_bytes: stage.attempted_bytes,
+                successful_bytes: stage.successful_bytes,
+                errors: stage.errors,
+                bytes_per_second: successful_bytes_per_second,
+            }),
+        );
         Ok(stage)
     }
 
-    fn stage_start(&mut self, phase: &str, round: u128, operation: &str) -> Result<()> {
+    fn stage_start(&mut self, phase: Phase, round: u128, kind: StageKind) -> Result<()> {
         check_running(self.stop)?;
         self.log.event(
             "stage_started",
-            json!({"phase": phase, "round": round, "operation": operation}),
+            json!({"phase": phase.name(), "round": round, "operation": kind.name()}),
         )?;
+        self.telemetry.stage_started(kind);
         if let Err(error) = self.device.check_ready() {
-            return self.stage_error(phase, round, operation, error);
+            return self.stage_error(phase, round, kind, error);
         }
         check_running(self.stop)
     }
 
     fn stage_error<T>(
         &mut self,
-        phase: &str,
+        phase: Phase,
         round: u128,
-        operation: &str,
+        kind: StageKind,
         error: anyhow::Error,
     ) -> Result<T> {
-        let result = self.log.event("stage_error", json!({
-            "phase": phase, "round": round, "operation": operation, "reason": format!("{error:#}"),
-        }));
+        let phase = phase.name();
+        let operation = kind.name();
+        let reason = format!("{error:#}");
+        self.telemetry
+            .stage_failed(kind, error.is::<Interrupted>(), &reason);
+        let result = self.log.event(
+            "stage_error",
+            json!({
+                "phase": phase, "round": round, "operation": operation, "reason": reason,
+            }),
+        );
         let error = error.context(format!("{phase} round {round} {operation}"));
         match result {
             Ok(()) => Err(error),

@@ -44,6 +44,7 @@ fn parses_run_and_pretest_options_before_device_discovery() -> anyhow::Result<()
                 "3.25",
                 "--temperature-sample-interval-seconds",
                 "60",
+                "--no-tui",
                 "--temperature-url",
                 "invalid",
             ])
