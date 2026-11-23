@@ -30,7 +30,7 @@ fn exact_inputs_and_block_budget_include_retention() {
 }
 
 #[test]
-fn recommendation_matches_enumeration_of_the_relative_capacity_grid() {
+fn reference_wear_estimate_uses_measured_round_size_and_partial_round_cost() -> anyhow::Result<()> {
     let timing = RoundTiming {
         trim_seconds: 30.0,
         write_seconds: 16.0,
@@ -46,9 +46,20 @@ fn recommendation_matches_enumeration_of_the_relative_capacity_grid() {
             ..timing
         },
         timing,
-    ])
-    .unwrap();
-    let host_visible_capacity_bytes = 4096;
+    ])?;
+    let measured_round_bytes = 4 * 4096;
+    let reference_endurance_write_bytes =
+        3 * u128::from(6 * 4096_u64) - u128::from(measured_round_bytes);
+    assert_eq!(
+        model.predict_wear_seconds(reference_endurance_write_bytes, measured_round_bytes)?,
+        232.75
+    );
+    Ok(())
+}
+
+#[test]
+fn recommendation_matches_enumeration_of_the_relative_capacity_grid() {
+    let reference_wear_seconds = 124.0;
     let logical_block_bytes = 512;
     for (pretest_nand_capacity_bytes, nand_capacity_step_bytes) in
         [(5120, 1024), (5121, 3), (5121, 8), (5120, 768)]
@@ -59,34 +70,23 @@ fn recommendation_matches_enumeration_of_the_relative_capacity_grid() {
             minimum_nand_capacity_bytes: 3100,
             maximum_nand_capacity_bytes: 14_000,
         };
-        for limit in [1.0, 57.0, 61.0, 73.0, 103.0, 130.0, 146.7, 1000.0] {
+        for limit in [1.0, 57.0, 61.0, 73.0, 103.0, 124.0, 130.0, 146.7, 1000.0] {
             let candidates: Vec<_> = (range.minimum_nand_capacity_bytes
                 ..=range.maximum_nand_capacity_bytes)
-                .filter(|capacity| {
-                    *capacity > host_visible_capacity_bytes && capacity % logical_block_bytes == 0
-                })
+                .filter(|capacity| capacity % logical_block_bytes == 0)
                 .filter(|capacity| {
                     capacity.abs_diff(pretest_nand_capacity_bytes) % nand_capacity_step_bytes == 0
                 })
                 .map(|capacity| {
-                    let budget = Budget::new(
-                        1,
+                    (
                         capacity,
-                        host_visible_capacity_bytes,
-                        logical_block_bytes,
+                        reference_wear_seconds
+                            * (capacity as f64 / pretest_nand_capacity_bytes as f64),
                     )
-                    .unwrap();
-                    (capacity, model.predict_wear_seconds(budget))
                 })
                 .collect();
             let expected = candidates.iter().rfind(|(_, duration)| *duration <= limit);
-            let selection = range.recommend(
-                1,
-                host_visible_capacity_bytes,
-                logical_block_bytes,
-                model,
-                limit,
-            );
+            let selection = range.recommend(logical_block_bytes, reference_wear_seconds, limit);
             match (selection, expected, candidates.first()) {
                 (Ok(CapacitySelection::Recommended(estimate)), Some(&(capacity, duration)), _) => {
                     assert_eq!(estimate.nand_capacity_bytes, capacity);
@@ -120,6 +120,57 @@ fn recommendation_matches_enumeration_of_the_relative_capacity_grid() {
 }
 
 #[test]
+fn recommends_nand_below_the_pretest_user_capacity_and_run_reserves_its_actual_user_capacity()
+-> anyhow::Result<()> {
+    let range = CapacityRange {
+        pretest_nand_capacity_bytes: 5120,
+        nand_capacity_step_bytes: 512,
+        minimum_nand_capacity_bytes: 3072,
+        maximum_nand_capacity_bytes: 3584,
+    };
+    let measured_round_bytes = 4096;
+    let round = RoundTiming {
+        write_seconds: 120.0,
+        ..RoundTiming::default()
+    };
+    let model = TimingModel::from_rounds(&[round, round])?;
+    let reference_endurance_write_bytes =
+        u128::from(range.pretest_nand_capacity_bytes - measured_round_bytes);
+    let reference_wear_seconds =
+        model.predict_wear_seconds(reference_endurance_write_bytes, measured_round_bytes)?;
+    range.validate(512)?;
+    let CapacitySelection::Recommended(estimate) =
+        range.recommend(512, reference_wear_seconds, 21.0)?
+    else {
+        panic!("the full candidate range fits even though it lies below the pretest USER capacity");
+    };
+    assert_eq!(estimate.nand_capacity_bytes, 3584);
+    assert_eq!(estimate.nand_capacity_step_offset, -3);
+    assert_eq!(estimate.predicted_wear_seconds, 21.0);
+    let report = serde_json::to_value(&estimate)?;
+    assert!(report.get("budget").is_none());
+
+    for actual_user_capacity_bytes in [2048, 3072] {
+        let budget = Budget::new(
+            1,
+            estimate.nand_capacity_bytes,
+            actual_user_capacity_bytes,
+            512,
+        )?;
+        assert_eq!(budget.total_host_write_budget_blocks, 7);
+        assert_eq!(
+            budget.host_visible_capacity_blocks,
+            actual_user_capacity_bytes / 512
+        );
+        assert_eq!(
+            budget.endurance_write_budget_blocks + u128::from(budget.host_visible_capacity_blocks),
+            budget.total_host_write_budget_blocks
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn enforces_the_1200_hour_limit_for_a_3_84_tb_device() -> anyhow::Result<()> {
     let host_visible_capacity_bytes = plan::parse_capacity("3.84TB")?;
     let seconds_per_full_io = host_visible_capacity_bytes as f64 / 3_400_000_000.0;
@@ -137,14 +188,16 @@ fn enforces_the_1200_hour_limit_for_a_3_84_tb_device() -> anyhow::Result<()> {
     };
     let limit = thermal::ENDURANCE_REFERENCE_DURATION_SECONDS;
     let logical_block_bytes = 512;
-    let pe = plan::parse_pe("1.8K")?;
-    let CapacitySelection::Recommended(estimate) = range.recommend(
-        pe,
-        host_visible_capacity_bytes,
-        logical_block_bytes,
-        model,
-        limit,
-    )?
+    let reference_time = |pe: u64| {
+        model.predict_wear_seconds(
+            u128::from(pe) * u128::from(range.pretest_nand_capacity_bytes)
+                - u128::from(host_visible_capacity_bytes),
+            host_visible_capacity_bytes,
+        )
+    };
+    let reference_wear_seconds = reference_time(plan::parse_pe("1.8K")?)?;
+    let CapacitySelection::Recommended(estimate) =
+        range.recommend(logical_block_bytes, reference_wear_seconds, limit)?
     else {
         panic!("the 3.968 TB capacity fits in 1200 hours");
     };
@@ -154,23 +207,14 @@ fn enforces_the_1200_hour_limit_for_a_3_84_tb_device() -> anyhow::Result<()> {
     );
     assert!(estimate.predicted_wear_seconds < limit);
     // The next step is closer to 1200 hours in absolute terms, but exceeds the limit.
-    let next_budget = Budget::new(
-        pe,
-        range.pretest_nand_capacity_bytes,
-        host_visible_capacity_bytes,
-        logical_block_bytes,
-    )?;
-    let next_seconds = model.predict_wear_seconds(next_budget);
-    assert!(next_seconds > limit);
-    assert!(next_seconds - limit < limit - estimate.predicted_wear_seconds);
+    assert!(reference_wear_seconds > limit);
+    assert!(reference_wear_seconds - limit < limit - estimate.predicted_wear_seconds);
 
     let CapacitySelection::NoCapacityWithinLimit {
         minimum_legal_capacity,
     } = range.recommend(
-        plan::parse_pe("3.25K")?,
-        host_visible_capacity_bytes,
         logical_block_bytes,
-        model,
+        reference_time(plan::parse_pe("3.25K")?)?,
         limit,
     )?
     else {
@@ -178,7 +222,7 @@ fn enforces_the_1200_hour_limit_for_a_3_84_tb_device() -> anyhow::Result<()> {
     };
     assert_eq!(
         minimum_legal_capacity.nand_capacity_bytes,
-        estimate.nand_capacity_bytes
+        host_visible_capacity_bytes
     );
     assert!(minimum_legal_capacity.predicted_wear_seconds > 2_000.0 * 3600.0);
     Ok(())

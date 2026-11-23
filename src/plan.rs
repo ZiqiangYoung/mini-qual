@@ -194,20 +194,29 @@ impl TimingModel {
         })
     }
 
-    pub fn predict_wear_seconds(&self, budget: Budget) -> f64 {
+    pub fn predict_wear_seconds(
+        &self,
+        write_bytes: u128,
+        measured_round_bytes: u64,
+    ) -> Result<f64> {
+        ensure!(
+            measured_round_bytes > 0,
+            "the measured pretest round size must be positive"
+        );
+        let round_bytes = u128::from(measured_round_bytes);
+        let full_rounds = write_bytes / round_bytes;
+        let final_round_bytes = write_bytes % round_bytes;
         let fixed =
             self.average.trim_seconds + self.average.flush_seconds + self.average.phase_gap_seconds;
         let scalable =
             self.average.write_seconds + self.average.read_seconds + self.average.locate_seconds;
-        let mut seconds = (fixed + scalable) * budget.full_rounds as f64;
-        if budget.final_partial_round_blocks > 0 {
-            seconds += fixed
-                + scalable
-                    * (budget.final_partial_round_blocks as f64
-                        / budget.host_visible_capacity_blocks as f64);
+        let mut seconds = (fixed + scalable) * full_rounds as f64;
+        if final_round_bytes > 0 {
+            seconds += fixed + scalable * (final_round_bytes as f64 / measured_round_bytes as f64);
         }
-        let rounds = budget.full_rounds + u128::from(budget.final_partial_round_blocks > 0);
-        seconds + self.average.round_gap_seconds.unwrap_or(0.0) * rounds.saturating_sub(1) as f64
+        let rounds = full_rounds + u128::from(final_round_bytes > 0);
+        Ok(seconds
+            + self.average.round_gap_seconds.unwrap_or(0.0) * rounds.saturating_sub(1) as f64)
     }
 }
 
@@ -223,7 +232,6 @@ pub struct CapacityRange {
 pub struct CapacityEstimate {
     pub nand_capacity_bytes: u64,
     pub nand_capacity_step_offset: i128,
-    pub budget: Budget,
     pub predicted_wear_seconds: f64,
     pub baseline_wear_seconds: f64,
     pub predicted_difference_seconds: f64,
@@ -238,11 +246,7 @@ pub enum CapacitySelection {
 }
 
 impl CapacityRange {
-    fn aligned_candidates(
-        self,
-        host_visible_capacity_bytes: u64,
-        logical_block_bytes: u64,
-    ) -> Result<(u64, u64, u64)> {
+    fn aligned_candidates(self, logical_block_bytes: u64) -> Result<(u64, u64, u64)> {
         ensure!(
             logical_block_bytes > 0,
             "logical block size must be positive"
@@ -268,15 +272,12 @@ impl CapacityRange {
             self.minimum_nand_capacity_bytes,
             self.maximum_nand_capacity_bytes
         );
-
-        let lower = self
-            .minimum_nand_capacity_bytes
-            .max(host_visible_capacity_bytes.saturating_add(1));
-        let upper = self.maximum_nand_capacity_bytes;
         ensure!(
-            lower <= upper,
-            "--maximum-nand-capacity ({upper} bytes) must exceed the device's host-visible capacity ({host_visible_capacity_bytes} bytes)"
+            self.minimum_nand_capacity_bytes > 0,
+            "--minimum-nand-capacity must be greater than 0 bytes"
         );
+        let lower = self.minimum_nand_capacity_bytes;
+        let upper = self.maximum_nand_capacity_bytes;
         let remainder = self.pretest_nand_capacity_bytes % self.nand_capacity_step_bytes;
         let (gcd, inverse) = gcd_coefficient(
             self.nand_capacity_step_bytes.into(),
@@ -316,38 +317,31 @@ impl CapacityRange {
         ))
     }
 
-    pub fn validate(
-        self,
-        host_visible_capacity_bytes: u64,
-        logical_block_bytes: u64,
-    ) -> Result<()> {
-        self.aligned_candidates(host_visible_capacity_bytes, logical_block_bytes)
-            .map(|_| ())
+    pub fn validate(self, logical_block_bytes: u64) -> Result<()> {
+        self.aligned_candidates(logical_block_bytes).map(|_| ())
     }
 
     pub fn recommend(
         self,
-        pe: u64,
-        host_visible_capacity_bytes: u64,
         logical_block_bytes: u64,
-        model: TimingModel,
+        reference_wear_seconds: f64,
         limit_seconds: f64,
     ) -> Result<CapacitySelection> {
         ensure!(
             limit_seconds.is_finite() && limit_seconds > 0.0,
             "wear duration limit must be finite and positive, got {limit_seconds} s"
         );
+        ensure!(
+            reference_wear_seconds.is_finite() && reference_wear_seconds > 0.0,
+            "predicted wear at the reference NAND capacity must take a finite positive time, got {reference_wear_seconds} s"
+        );
         let (first, aligned_candidate_spacing_bytes, last_index) =
-            self.aligned_candidates(host_visible_capacity_bytes, logical_block_bytes)?;
+            self.aligned_candidates(logical_block_bytes)?;
         let candidate = |index| -> Result<CapacityEstimate> {
             let nand_capacity_bytes = first + index * aligned_candidate_spacing_bytes;
-            let budget = Budget::new(
-                pe,
-                nand_capacity_bytes,
-                host_visible_capacity_bytes,
-                logical_block_bytes,
-            )?;
-            let predicted_wear_seconds = model.predict_wear_seconds(budget);
+            let capacity_ratio =
+                nand_capacity_bytes as f64 / self.pretest_nand_capacity_bytes as f64;
+            let predicted_wear_seconds = reference_wear_seconds * capacity_ratio;
             ensure!(
                 predicted_wear_seconds.is_finite() && predicted_wear_seconds >= 0.0,
                 "invalid predicted wear duration {predicted_wear_seconds} s for {nand_capacity_bytes} bytes"
@@ -357,7 +351,6 @@ impl CapacityRange {
                 nand_capacity_step_offset: (i128::from(nand_capacity_bytes)
                     - i128::from(self.pretest_nand_capacity_bytes))
                     / i128::from(self.nand_capacity_step_bytes),
-                budget,
                 predicted_wear_seconds,
                 baseline_wear_seconds: limit_seconds,
                 predicted_difference_seconds: predicted_wear_seconds - limit_seconds,

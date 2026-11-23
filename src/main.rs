@@ -478,17 +478,16 @@ fn pretest(args: PretestArgs) -> Result<()> {
         minimum_nand_capacity_bytes: args.minimum_nand_capacity,
         maximum_nand_capacity_bytes: args.maximum_nand_capacity,
     };
+    range.validate(device.logical_block_bytes)?;
+    let measured_round_bytes = device.host_visible_capacity_bytes;
+    let reference_write_budget_bytes =
+        u128::from(args.device.pe) * u128::from(args.pretest_nand_capacity);
     ensure!(
-        args.pretest_nand_capacity > device.host_visible_capacity_bytes,
-        "--pretest-nand-capacity is {} bytes but must exceed the host-visible capacity of {} bytes on {}",
-        args.pretest_nand_capacity,
-        device.host_visible_capacity_bytes,
-        device.path.display()
+        reference_write_budget_bytes > u128::from(measured_round_bytes),
+        "the pretest reference write budget is {reference_write_budget_bytes} bytes and must leave a positive wear budget after reserving the {measured_round_bytes}-byte retention write"
     );
-    range.validate(
-        device.host_visible_capacity_bytes,
-        device.logical_block_bytes,
-    )?;
+    let reference_endurance_write_bytes =
+        reference_write_budget_bytes - u128::from(measured_round_bytes);
     let ownership = device.acquire()?;
     let mut log = open_log(&args.device, &device, &ownership, "pretest")?;
     let mut dashboard = open_dashboard(&args.device, &device, &log, None, &stop);
@@ -517,7 +516,7 @@ fn pretest(args: PretestArgs) -> Result<()> {
             if stop.load(Ordering::Acquire) {
                 break Ok(());
             }
-            match trial.wear_round(round, device.host_visible_capacity_bytes, last_end) {
+            match trial.wear_round(round, measured_round_bytes, last_end) {
                 Ok((timing, ended)) => {
                     timings.push(timing);
                     last_end = Some(ended);
@@ -547,6 +546,8 @@ fn pretest(args: PretestArgs) -> Result<()> {
             return Ok(PretestSummary::Insufficient(timings.len()));
         }
         let model = TimingModel::from_rounds(&timings)?;
+        let reference_wear_seconds =
+            model.predict_wear_seconds(reference_endurance_write_bytes, measured_round_bytes)?;
         let window = WearWindow {
             start_seconds: first_started_elapsed,
             end_seconds: last_completed_elapsed,
@@ -563,10 +564,8 @@ fn pretest(args: PretestArgs) -> Result<()> {
             Err(error) => (None, Some(format!("{error:#}"))),
         };
         let capacity_selection = range.recommend(
-            args.device.pe,
-            device.host_visible_capacity_bytes,
             device.logical_block_bytes,
-            model,
+            reference_wear_seconds,
             thermal::ENDURANCE_REFERENCE_DURATION_SECONDS,
         )?;
         let (event, recommendation, minimum_legal_capacity) = match &capacity_selection {
@@ -582,10 +581,10 @@ fn pretest(args: PretestArgs) -> Result<()> {
             ),
         };
         let report = json!({
-            "host_visible_capacity_bytes": device.host_visible_capacity_bytes,
             "pe": args.device.pe,
             "range": range,
             "model": model,
+            "reference_wear_seconds": reference_wear_seconds,
             "recommendation": recommendation,
             "minimum_legal_capacity": minimum_legal_capacity,
             "predicted_equivalent_wear_seconds_at_measured_temperatures":
@@ -606,10 +605,9 @@ fn pretest(args: PretestArgs) -> Result<()> {
         }
         PretestSummary::Assessed(CapacitySelection::Recommended(recommendation)) => {
             println!(
-                "推荐 NAND 物理容量 {} Byte，档位偏移 {:+}，当前主机可见容量 {} Byte。",
+                "推荐 NAND 物理容量 {} Byte，档位偏移 {:+}。",
                 recommendation.nand_capacity_bytes,
-                recommendation.nand_capacity_step_offset,
-                device.host_visible_capacity_bytes
+                recommendation.nand_capacity_step_offset
             );
             println!(
                 "预计磨损 {:.6} 小时，距离 {:.0} 小时上限还有 {:.6} 小时。",
@@ -621,8 +619,7 @@ fn pretest(args: PretestArgs) -> Result<()> {
         }
         PretestSummary::Assessed(CapacitySelection::NoCapacityWithinLimit { minimum_legal_capacity }) => {
             eprintln!(
-                "按完整轮次实测耗时估算，在当前主机可见容量 {} Byte、PE {} 次和容量档位约束下，无容量可在 {:.0} 小时内完成磨损。",
-                device.host_visible_capacity_bytes,
+                "按完整轮次实测耗时估算，在 PE {} 次和容量档位约束下，无 NAND 容量可在 {:.0} 小时内完成磨损。",
                 args.device.pe,
                 minimum_legal_capacity.baseline_wear_seconds / 3600.0
             );
