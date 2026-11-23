@@ -33,12 +33,26 @@ fn trial_info(mode: Mode) -> TrialInfo {
     }
 }
 
-fn screen(width: u16, height: u16, snapshot: &Snapshot, stopping: bool) -> String {
+fn render_test_terminal(
+    width: u16,
+    height: u16,
+    snapshot: &Snapshot,
+    stopping: bool,
+) -> Terminal<TestBackend> {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|frame| render(frame, snapshot, stopping))
         .unwrap();
-    format!("{:?}", terminal.backend().buffer())
+    terminal
+}
+
+fn screen(width: u16, height: u16, snapshot: &Snapshot, stopping: bool) -> String {
+    format!(
+        "{:?}",
+        render_test_terminal(width, height, snapshot, stopping)
+            .backend()
+            .buffer()
+    )
 }
 
 #[test]
@@ -99,6 +113,8 @@ fn full_and_compact_layouts_show_work_temperature_and_bandwidth() {
             "50.0%",
             "256.0 MB / 512.0 MB",
             "32.0 MB/s",
+            "31.68",
+            "32.32",
             "预计剩余 00:00:04",
             "失败 32.0 MB",
             "42.75 °C",
@@ -172,7 +188,7 @@ fn bandwidth_chart_shows_recent_samples_in_wide_and_compact_layouts() {
     let telemetry = Telemetry::new(trial_info(Mode::Pretest));
     telemetry.start_round(Phase::Wear, 1, 10_000 * MB, 10_000 * MB);
     telemetry.stage_started(StageKind::Read);
-    for rate in [9_500.0, 2_500.0, 1_500.0, 0.0] {
+    for rate in [9_500.0, 1_505.0, 1_501.0, 1_502.0] {
         telemetry.io_progress(IoProgress {
             attempted_bytes: 4_000 * MB,
             successful_bytes: 3_000 * MB,
@@ -181,6 +197,7 @@ fn bandwidth_chart_shows_recent_samples_in_wide_and_compact_layouts() {
             ..IoProgress::default()
         });
     }
+    telemetry.message("读取进行中");
     let mut snapshot = telemetry.snapshot().unwrap();
     let now = Instant::now();
     for (sample, age) in snapshot.tasks[3]
@@ -192,24 +209,47 @@ fn bandwidth_chart_shows_recent_samples_in_wide_and_compact_layouts() {
     }
 
     for (width, height) in [(120, 30), (100, 25), (80, 24)] {
-        let contents = screen(width, height, &snapshot, false);
-        for expected in ["−10 s", "现在", "2.5 GB/s", "预计剩余 00:00:06", "壳温"] {
+        let terminal = render_test_terminal(width, height, &snapshot, false);
+        let buffer = terminal.backend().buffer();
+        let contents = format!("{buffer:?}");
+        for expected in [
+            "实时带宽 · GB/s",
+            "−10 s",
+            "现在",
+            "1.5006",
+            "1.5054",
+            "预计剩余 00:00:06",
+            "壳温",
+            "读取进行中",
+        ] {
             assert!(
                 contents.contains(expected),
                 "{expected} missing from {contents}"
             );
         }
-        assert!(!contents.contains("9.5 GB/s"), "{contents}");
         assert!(
             contents.contains(|ch| matches!(ch, '\u{2801}'..='\u{28ff}')),
             "{contents}"
         );
+        let title_index = buffer
+            .content
+            .iter()
+            .position(|cell| cell.symbol() == "实")
+            .unwrap();
+        let title_row = (title_index / usize::from(width)) as u16;
+        let title_column = (title_index % usize::from(width)) as u16;
+        let chart_left = (0..title_column)
+            .rev()
+            .find(|&column| buffer[(column, title_row)].symbol() == "┌")
+            .expect("chart has its own top border");
+        assert_eq!(buffer[(width - 1, title_row)].symbol(), "┐");
+        assert!((chart_left..width).all(|column| buffer[(column, title_row - 1)].symbol() == " "));
     }
 
     let short = screen(80, 12, &snapshot, false);
     assert!(short.contains("预计剩余 00:00:06"), "{short}");
-    assert!(short.contains("近期 0 MB/s"), "{short}");
-    assert!(!short.contains("−10 s"), "{short}");
+    assert!(short.contains("近期 1.5 GB/s"), "{short}");
+    assert!(!short.contains("实时带宽"), "{short}");
 }
 
 #[test]
@@ -224,7 +264,8 @@ fn bandwidth_history_keeps_measured_zero_and_skips_absent_and_final_rates() {
         });
     }
     let contents = screen(80, 24, &telemetry.snapshot().unwrap(), false);
-    assert!(contents.contains("实时带宽"), "{contents}");
+    assert!(contents.contains("实时带宽 · MB/s"), "{contents}");
+    assert!(contents.contains("0.0│"), "{contents}");
     assert!(contents.contains("现在"), "{contents}");
 
     telemetry.stage_completed(

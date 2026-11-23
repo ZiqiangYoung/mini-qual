@@ -6,12 +6,12 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Cell, Chart, Dataset, Gauge, GraphType, Paragraph, Row, Table, Wrap,
+    Axis, Block, Cell, Chart, Dataset, Gauge, GraphType, Padding, Paragraph, Row, Table, Wrap,
 };
 use ratatui::{Frame, Terminal};
 
@@ -24,8 +24,10 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(250);
 const INPUT_INTERVAL: Duration = Duration::from_millis(50);
 const LIVE_SAMPLE_MAX_AGE: Duration = Duration::from_secs(3);
 const BANDWIDTH_CHART_MIN_WIDTH: u16 = 42;
-const BANDWIDTH_CHART_MIN_HEIGHT: u16 = 4;
+const BANDWIDTH_CHART_MIN_HEIGHT: u16 = 6;
 const BANDWIDTH_CHART_COMPACT_HEIGHT: u16 = 8;
+const BYTES_PER_MB: f64 = 1_000_000.0;
+const BYTES_PER_GB: f64 = 1_000_000_000.0;
 const ACCENT: Color = Color::LightCyan;
 
 pub struct Dashboard {
@@ -154,23 +156,25 @@ fn is_interrupt(key: KeyEvent) -> bool {
 fn render(frame: &mut Frame<'_>, view: &Snapshot, stopping: bool) {
     let area = frame.area();
     if area.width >= 100 && area.height >= 25 {
-        let [overview, work, observations, footer] = Layout::vertical([
+        let [overview, work, footer] = Layout::vertical([
             Constraint::Length(5),
-            Constraint::Min(8),
-            Constraint::Length(match area.height {
-                25 => 7,
-                26..=29 => 8,
-                _ => 11,
-            }),
+            Constraint::Min(0),
             Constraint::Length(1),
         ])
         .areas(area);
-        let [tasks, progress] =
-            Layout::horizontal([Constraint::Percentage(53), Constraint::Percentage(47)])
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)])
+                .spacing(1)
                 .areas(work);
-        let [temperature, events] =
-            Layout::horizontal([Constraint::Percentage(53), Constraint::Percentage(47)])
-                .areas(observations);
+        let [tasks, temperature, events] = Layout::vertical([
+            Constraint::Length(8),
+            Constraint::Length(if area.height >= 30 { 11 } else { 7 }),
+            Constraint::Min(0),
+        ])
+        .areas(left);
+        let [progress, chart] = Layout::vertical([Constraint::Length(8), Constraint::Min(0)])
+            .spacing(1)
+            .areas(right);
 
         frame.render_widget(
             Paragraph::new(vec![
@@ -183,6 +187,9 @@ fn render(frame: &mut Frame<'_>, view: &Snapshot, stopping: bool) {
         );
         render_tasks(frame, tasks, view);
         render_progress(frame, progress, view, true);
+        if let Some(task) = current_task(&view.tasks) {
+            render_bandwidth(frame, chart, task);
+        }
         render_temperature(frame, temperature, view);
         render_events(frame, events, view);
         render_footer(frame, footer, view, stopping, true);
@@ -210,23 +217,27 @@ fn render_compact(frame: &mut Frame<'_>, area: Rect, view: &Snapshot, stopping: 
     ])
     .areas(area);
     let metrics_height = if enough_for_details { 5 } else { 3 };
-    let chart_height = work
+    // Reserve one row each for temperature, events, and the gap above the chart.
+    let chart_space = work
         .height
-        .saturating_sub(tasks_height + metrics_height + 2);
+        .saturating_sub(tasks_height + metrics_height + 3);
+    let task = current_task(&view.tasks);
     let show_chart = enough_for_details
         && work.width >= BANDWIDTH_CHART_MIN_WIDTH
-        && chart_height >= BANDWIDTH_CHART_MIN_HEIGHT
-        && current_task(&view.tasks)
+        && chart_space >= BANDWIDTH_CHART_MIN_HEIGHT
+        && task
             .and_then(|task| task.recent_bandwidth.back())
             .is_some_and(|sample| sample.observed_at.elapsed() <= BANDWIDTH_HISTORY_WINDOW);
-    let progress_height = if show_chart {
-        metrics_height + chart_height.min(BANDWIDTH_CHART_COMPACT_HEIGHT)
+    let chart_height = if show_chart {
+        chart_space.min(BANDWIDTH_CHART_COMPACT_HEIGHT)
     } else {
-        metrics_height
+        0
     };
-    let [tasks, progress, temperature, events] = Layout::vertical([
+    let [tasks, progress, _, chart, temperature, events] = Layout::vertical([
         Constraint::Length(tasks_height),
-        Constraint::Length(progress_height),
+        Constraint::Length(metrics_height),
+        Constraint::Length(u16::from(show_chart)),
+        Constraint::Length(chart_height),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
@@ -258,6 +269,9 @@ fn render_compact(frame: &mut Frame<'_>, area: Rect, view: &Snapshot, stopping: 
     };
     frame.render_widget(Paragraph::new(rows), tasks);
     render_progress(frame, progress, view, false);
+    if let Some(task) = task {
+        render_bandwidth(frame, chart, task);
+    }
     frame.render_widget(Paragraph::new(temperature_line(view)), temperature);
     if let Some((message, style)) = latest_event(view) {
         frame.render_widget(
@@ -357,15 +371,7 @@ fn render_progress(frame: &mut Frame<'_>, area: Rect, view: &Snapshot, wide: boo
         );
         content = metrics;
     }
-    let [metrics, chart] = Layout::vertical([
-        Constraint::Length((lines.len() as u16).min(content.height)),
-        Constraint::Min(0),
-    ])
-    .areas(content);
-    frame.render_widget(Paragraph::new(lines), metrics);
-    if let Some(task) = task {
-        render_bandwidth(frame, chart, task);
-    }
+    frame.render_widget(Paragraph::new(lines), content);
 }
 
 fn compact_progress(view: &Snapshot) -> Vec<Line<'static>> {
@@ -466,7 +472,7 @@ fn current_task(tasks: &[Task]) -> Option<&Task> {
         })
 }
 
-fn render_bandwidth(frame: &mut Frame<'_>, mut area: Rect, task: &Task) {
+fn render_bandwidth(frame: &mut Frame<'_>, area: Rect, task: &Task) {
     if area.width < BANDWIDTH_CHART_MIN_WIDTH || area.height < BANDWIDTH_CHART_MIN_HEIGHT {
         return;
     }
@@ -485,8 +491,7 @@ fn render_bandwidth(frame: &mut Frame<'_>, mut area: Rect, task: &Task) {
         return;
     };
     let window_seconds = (-earliest).ceil().max(10.0);
-    let peak = points.iter().map(|(_, rate)| *rate).fold(0.0, f64::max);
-    let upper = if peak > 0.0 { peak } else { 1_000_000.0 };
+    let (scale, title) = bandwidth_axis(&points, area.height > BANDWIDTH_CHART_MIN_HEIGHT);
     let datasets = points
         .chunk_by(|left, right| right.0 - left.0 <= LIVE_SAMPLE_MAX_AGE.as_secs_f64())
         .map(|segment| {
@@ -497,24 +502,65 @@ fn render_bandwidth(frame: &mut Frame<'_>, mut area: Rect, task: &Task) {
                 .data(segment)
         })
         .collect();
-    if area.height > BANDWIDTH_CHART_MIN_HEIGHT {
-        let [heading, chart] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-        frame.render_widget(Paragraph::new("实时带宽"), heading);
-        area = chart;
-    }
     let chart = Chart::new(datasets)
+        .block(
+            panel(title)
+                .title_style(Style::default().fg(ACCENT))
+                .padding(Padding::horizontal(1)),
+        )
         .x_axis(
             Axis::default()
+                .style(Color::Gray)
                 .bounds([-window_seconds, 0.0])
                 .labels(vec![format!("−{window_seconds:.0} s"), "现在".into()]),
         )
-        .y_axis(
-            Axis::default()
-                .bounds([0.0, upper])
-                .labels(vec!["0".into(), format_rate(Some(upper))]),
-        );
+        .y_axis(scale);
     frame.render_widget(chart, area);
+}
+
+fn bandwidth_axis(points: &[(f64, f64)], show_midpoint: bool) -> (Axis<'static>, &'static str) {
+    let (minimum, maximum) = points
+        .iter()
+        .map(|(_, rate)| *rate)
+        .fold((f64::INFINITY, 0.0_f64), |(minimum, maximum), rate| {
+            (minimum.min(rate), maximum.max(rate))
+        });
+    let margin = if maximum > minimum {
+        (maximum - minimum) * 0.1
+    } else if maximum > 0.0 {
+        maximum * 0.01
+    } else {
+        BYTES_PER_MB
+    };
+    let lower = minimum - margin.min(minimum / 2.0);
+    let upper = maximum + margin;
+    let (unit, title) = if maximum >= BYTES_PER_GB {
+        (BYTES_PER_GB, " 实时带宽 · GB/s ")
+    } else {
+        (BYTES_PER_MB, " 实时带宽 · MB/s ")
+    };
+    let span = (upper - lower) / unit;
+    let precision = (1.0 - span.log10().floor()).clamp(1.0, 9.0) as usize;
+    let smallest_label = 10.0_f64.powi(-(precision as i32));
+    let label = |rate: f64| {
+        let scaled = rate / unit;
+        if scaled > 0.0 && scaled < smallest_label {
+            format!("<{smallest_label:.precision$}")
+        } else {
+            format!("{scaled:.precision$}")
+        }
+    };
+    let mut labels = vec![label(lower)];
+    if show_midpoint {
+        labels.push(label(lower + (upper - lower) / 2.0));
+    }
+    labels.push(label(upper));
+    let axis = Axis::default()
+        .style(Color::Gray)
+        .bounds([lower, upper])
+        .labels_alignment(Alignment::Right)
+        .labels(labels);
+    (axis, title)
 }
 
 fn render_temperature(frame: &mut Frame<'_>, area: Rect, view: &Snapshot) {
@@ -800,8 +846,6 @@ fn format_rate(rate: Option<f64>) -> String {
 }
 
 fn format_scaled_bytes(bytes: f64) -> String {
-    const BYTES_PER_MB: f64 = 1_000_000.0;
-    const BYTES_PER_GB: f64 = 1_000_000_000.0;
     if bytes >= BYTES_PER_GB {
         return format!("{:.1} GB", bytes / BYTES_PER_GB);
     }
